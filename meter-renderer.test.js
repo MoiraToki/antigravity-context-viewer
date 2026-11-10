@@ -1369,3 +1369,214 @@ test('online update and GitHub entry points: openExternal whitelist enforcement 
 
   api.dispose();
 });
+
+test('unlock drawer UI controls, read-only & recovery states, and 100% zero coupling with d.budget and #key-limit', async () => {
+  const h = harness();
+  h.finishScan();
+
+  let mockUnlockStatus = {
+    ok: true,
+    supported: true,
+    targetPath: 'C:\\App\\resources\\app\\extensions\\antigravity\\bin\\language_server_windows_x64.exe',
+    currentSha256: 'sha256_orig_256k',
+    instanceIdentity: { appRoot: 'C:\\App\\resources\\app', targetId: 'abcd1234ef567890' },
+    overallState: 'ORIGINAL_256K',
+    tierKey: 'original_256k',
+    tierLabel: '256K (默认)',
+    capTokens: 262144,
+    gate3A: { state: '256K', patchVA: 0x10023a },
+    gate3B: { state: 'UNPATCHED', patchVA: 0x100426, patchLength: 2 },
+    backup: { exists: false, valid: false },
+    canWrite: true,
+    canRestore: false,
+    needsRecovery: false,
+    runtimeState: 'unknown',
+    cleanupState: { committedOldFiles: 0 }
+  };
+
+  const calls = [];
+  h.sandbox.window.contextMeterAPI = {
+    ...h.sandbox.window.contextMeterAPI,
+    getUnlockStatus: async () => {
+      calls.push({ fn: 'status' });
+      return { ...mockUnlockStatus };
+    },
+    dryRunUnlock: async (opts) => {
+      calls.push({ fn: 'dry-run', opts });
+      return {
+        ok: true,
+        willChange: true,
+        beforeSha256: mockUnlockStatus.currentSha256,
+        instanceIdentity: mockUnlockStatus.instanceIdentity,
+        targetSpec: { tier: opts.target.tier, label: opts.target.tier === 'custom' ? `${opts.target.customK}K (自定义)` : '512K (v4)' },
+        gate3A: { patchVA: 0x10023a },
+        gate3B: { patchVA: 0x100426, patchLength: 2 }
+      };
+    },
+    applyUnlock: async (opts) => {
+      calls.push({ fn: 'apply', opts });
+      mockUnlockStatus = {
+        ...mockUnlockStatus,
+        currentSha256: 'sha256_patched_512k',
+        overallState: 'PATCHED_VERIFIED',
+        tierKey: opts.target.tier,
+        tierLabel: opts.target.tier === '1m' ? '1M (1,000,000)' : (opts.target.tier === 'custom' ? `${opts.target.customK}K (自定义)` : '512K (v4)'),
+        capTokens: opts.target.tier === '1m' ? 1000000 : 524288,
+        gate3A: { state: 'BOUNDED_CUSTOM', patchVA: 0x10023a },
+        gate3B: { state: 'VERIFIED_PATCHED', patchVA: 0x100426, patchLength: 2 },
+        backup: { exists: true, valid: true },
+        canWrite: true,
+        canRestore: true,
+        runtimeState: 'pending_restart',
+        cleanupState: { committedOldFiles: 1 }
+      };
+      return {
+        ok: true,
+        changed: true,
+        strategy: 'hot_rename',
+        targetSpec: { tier: opts.target.tier, label: mockUnlockStatus.tierLabel }
+      };
+    },
+    restoreUnlock: async () => {
+      calls.push({ fn: 'restore' });
+      mockUnlockStatus = {
+        ...mockUnlockStatus,
+        currentSha256: 'sha256_orig_256k',
+        overallState: 'ORIGINAL_256K',
+        tierKey: 'original_256k',
+        tierLabel: '256K (默认)',
+        capTokens: 262144,
+        gate3A: { state: '256K', patchVA: 0x10023a },
+        gate3B: { state: 'UNPATCHED', patchVA: 0x100426, patchLength: 2 },
+        backup: { exists: true, valid: true },
+        canWrite: true,
+        canRestore: false,
+        runtimeState: 'pending_restart'
+      };
+      return { ok: true, restored: true };
+    },
+    recoverUnlock: async () => {
+      calls.push({ fn: 'recover' });
+      mockUnlockStatus = { ...mockUnlockStatus, needsRecovery: false, canWrite: true };
+      return { ok: true, recovered: true };
+    }
+  };
+
+  const api = h.sandbox.__AGContextMeter;
+
+  // 1. Open unlock drawer and verify initial 256K status
+  h.elements.get('btn-toggle-unlock').click();
+  await h.flush();
+  assert.equal(h.elements.get('unlock-drawer-body').style.display, 'block');
+  assert.equal(h.elements.get('unlock-header-pill').textContent, '磁盘: 256K 默认');
+  assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
+  assert.equal(h.elements.get('btn-unlock-apply').disabled, false);
+
+  // 2. Select 512K, run dry-run, then apply
+  h.elements.get('unlock-tier-512k').click();
+  h.elements.get('btn-unlock-dry-run').click();
+  await h.flush();
+  assert.match(h.elements.get('unlock-feedback-box').textContent, /预检通过.*512K/);
+
+  h.elements.get('btn-unlock-apply').click();
+  await h.flush();
+  const applyCall = calls.find(c => c.fn === 'apply');
+  assert.ok(applyCall);
+  assert.equal(applyCall.opts.expectedBeforeSha256, 'sha256_orig_256k');
+  assert.deepEqual(applyCall.opts.expectedInstanceIdentity, { appRoot: 'C:\\App\\resources\\app', targetId: 'abcd1234ef567890' });
+  assert.match(h.elements.get('unlock-header-pill').textContent, /待重启/);
+  assert.match(h.elements.get('unlock-feedback-box').textContent, /NTFS 热重命名替换/);
+  assert.equal(h.elements.get('btn-unlock-restore').disabled, false);
+
+  // 3. Test custom tier selection (768K)
+  h.elements.get('unlock-tier-custom').click();
+  assert.equal(h.elements.get('unlock-custom-row').style.display, 'flex');
+  const customInput = h.elements.get('unlock-custom-k-input');
+  customInput.value = '768';
+  customInput.trigger('input', { target: { value: '768' } });
+  h.elements.get('btn-unlock-dry-run').click();
+  await h.flush();
+  assert.match(h.elements.get('unlock-feedback-box').textContent, /768K/);
+
+  // 4. Test read-only unverified patch state (no backup) -> disables apply/dry-run/restore
+  mockUnlockStatus = {
+    ...mockUnlockStatus,
+    overallState: 'PATCHED_UNVERIFIED_READONLY',
+    tierLabel: '512K (外部补丁)',
+    backup: { exists: false, valid: false },
+    canWrite: false,
+    canRestore: false,
+    runtimeState: 'unknown'
+  };
+  await api.refreshUnlockStatus();
+  assert.match(h.elements.get('unlock-header-pill').textContent, /只读/);
+  assert.equal(h.elements.get('btn-unlock-apply').disabled, true);
+  assert.equal(h.elements.get('btn-unlock-dry-run').disabled, true);
+  assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
+
+  // 5. Test needsRecovery state and recover button
+  mockUnlockStatus = {
+    ...mockUnlockStatus,
+    ok: false,
+    code: 'UNFINISHED_TRANSACTION',
+    error: '存在未完成的替换事务 (OLD_MOVED)',
+    needsRecovery: true,
+    canWrite: false,
+    canRestore: false
+  };
+  await api.refreshUnlockStatus();
+  assert.equal(h.elements.get('unlock-header-pill').textContent, '⚠ 事务待恢复');
+  assert.equal(h.elements.get('btn-unlock-recover').style.display, 'inline-block');
+  h.elements.get('btn-unlock-recover').click();
+  await h.flush();
+  assert.ok(calls.some(c => c.fn === 'recover'));
+
+  // 6. Verify 100% zero coupling between unlock state and d.budget / #key-limit across all 3 scenarios:
+  // (a) Normal reported budget (256000 -> 256K) even while unlock status is 1M / 512K
+  h.pending[0].resolve(response({
+    usage: { inputTokens: 120000, outputTokens: 1000 },
+    chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
+  }));
+  await h.flush();
+  assert.equal(api.snapshot().latest.budget, 256000);
+  assert.equal(h.elements.get('key-limit').textContent, '256K');
+
+  // (b) Missing budget -> #key-limit is '—' (never substituted by local unlock capTokens)
+  h.sandbox.location.pathname = '/c/33333333-3333-3333-3333-333333333333';
+  h.tick();
+  h.finishScan(1);
+  h.pending[1].resolve(response({
+    usage: { inputTokens: 50000, outputTokens: 500 }
+  }));
+  await h.flush();
+  assert.equal(api.snapshot().latest.budget, null);
+  assert.equal(h.elements.get('key-limit').textContent, '—');
+
+  // (c) Error without budget -> preserves 983040 (983K) fallback in #key-limit
+  h.sandbox.location.pathname = '/c/44444444-4444-4444-4444-444444444444';
+  h.tick();
+  h.finishScan(2);
+  h.pending[2].resolve(response({
+    usage: { inputTokens: 80000, outputTokens: 200 },
+    retryInfos: [{ error: 'request failed: stream idle timeout (5m0s): context deadline exceeded', usage: { model: 'gemini' } }]
+  }));
+  await h.flush();
+  assert.equal(h.elements.get('key-limit').textContent, '983K');
+
+  // Restore original 256K and verify #key-limit is still untouched
+  mockUnlockStatus = {
+    ...mockUnlockStatus,
+    ok: true,
+    overallState: 'PATCHED_VERIFIED',
+    canWrite: true,
+    canRestore: true,
+    needsRecovery: false
+  };
+  await api.refreshUnlockStatus();
+  h.elements.get('btn-unlock-restore').click();
+  await h.flush();
+  assert.ok(calls.some(c => c.fn === 'restore'));
+  assert.equal(h.elements.get('key-limit').textContent, '983K');
+
+  api.dispose();
+});

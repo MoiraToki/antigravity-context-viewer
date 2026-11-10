@@ -131,6 +131,63 @@
         <div id="speed-takeaway" class="key-takeaway">等待首次模型输出产生速度统计…</div>
       </div>
 
+      <!-- 二级交互折叠区 0: 本地压缩上限配置 (Windows x64 language_server.exe 补丁与还原) -->
+      <div id="unlock-drawer" class="tech-drawer">
+        <button id="btn-toggle-unlock" class="drawer-trigger" aria-expanded="false" type="button">
+          <span class="drawer-trigger-left">
+            <span>🔓 本地压缩上限配置</span>
+            <span id="unlock-header-pill" class="key-pill pill-muted" style="font-size:10px;padding:1px 6px;">检测中</span>
+          </span>
+          <span id="unlock-drawer-arrow" class="drawer-arrow">▼ 展开设置</span>
+        </button>
+        <div id="unlock-drawer-body" class="drawer-body" style="display:none;">
+          <div class="unlock-card">
+            <dl class="unlock-status-dl">
+              <dt>当前磁盘状态</dt>
+              <dd id="unlock-disk-status">尚未读取状态</dd>
+              <dt>同构建原版备份</dt>
+              <dd id="unlock-backup-status">—</dd>
+              <dt>运行生效状态</dt>
+              <dd id="unlock-runtime-status">—</dd>
+              <dt>目标二进制路径</dt>
+              <dd id="unlock-target-path" class="unlock-path-val">—</dd>
+            </dl>
+
+            <div class="unlock-tier-section">
+              <div class="unlock-section-lbl">目标压缩上限档位（仅修改本地 Checkpoint Cap，不改变服务端模型最大容量）：</div>
+              <div class="unlock-tier-bar" role="radiogroup" aria-label="本地压缩上限档位">
+                <button id="unlock-tier-256k" class="switch-pill-btn active" type="button" data-tier="256k">256K 默认</button>
+                <button id="unlock-tier-512k" class="switch-pill-btn" type="button" data-tier="512k">512K (v4)</button>
+                <button id="unlock-tier-1m" class="switch-pill-btn" type="button" data-tier="1m" title="1,000,000 tokens">1M (1000K)</button>
+                <button id="unlock-tier-unlimited" class="switch-pill-btn" type="button" data-tier="unlimited">取消本地封顶 (v3)</button>
+                <button id="unlock-tier-custom" class="switch-pill-btn" type="button" data-tier="custom">自定义…</button>
+              </div>
+              <div id="unlock-custom-row" class="unlock-custom-row" style="display:none;">
+                <label for="unlock-custom-k-input" class="unlock-custom-lbl">自定义上限 (64–4096 K, 1K = 1024 tokens)：</label>
+                <div style="display:flex;align-items:center;gap:4px;">
+                  <input id="unlock-custom-k-input" class="unlock-custom-input" type="number" min="64" max="4096" step="1" value="768" aria-label="自定义上限 K 值" />
+                  <span style="font-size:11px;color:var(--ag-text-muted);font-weight:600;">K</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="unlock-actions-row">
+              <button id="btn-unlock-dry-run" class="unlock-btn" type="button">🔍 预检 (Dry-Run)</button>
+              <button id="btn-unlock-apply" class="unlock-btn unlock-btn-primary" type="button">⚡ 应用所选档位</button>
+              <button id="btn-unlock-restore" class="unlock-btn" type="button">↩ 完整还原原版 (.bak)</button>
+              <button id="btn-unlock-recover" class="unlock-btn unlock-btn-warn" type="button" style="display:none;">🛠 恢复中断事务</button>
+              <button id="btn-unlock-refresh" class="unlock-btn" type="button" title="刷新磁盘二进制与备份状态">↻ 刷新</button>
+            </div>
+
+            <div id="unlock-feedback-box" class="unlock-feedback-box" data-tone="info" style="display:none;" role="status" aria-live="polite"></div>
+
+            <div id="unlock-side-effect-note" class="unlock-side-effect-note">
+              <strong>⚠ 机制与副作用说明：</strong>实际触发上下文压缩的阈值为 <code>min(模型真实预算, 本地档位)</code>（例如 Gemini 1M 模型默认被本地 256K 截断；调至 512K/1M 后按设置值触发；若模型自身上限仅 200K，则调高本地档位不会突破 200K）。启用非 256K 档位会同时将 <code>selectCheckpointExperimentKey</code> (Gate 3B) 置为 NOP，跳过整段实验分支，可能影响同分支下的其他实验项。修改磁盘文件后，<strong>必须完全退出并重启 Antigravity 客户端</strong>，新启动的 <code>language_server.exe</code> 进程才会加载新上限。
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 二级交互折叠区 1: 面板背景与指标颜色自定义（就近放置于面板 B 内部） -->
       <div class="tech-drawer">
         <button id="btn-toggle-colors" class="drawer-trigger" aria-expanded="false" type="button">

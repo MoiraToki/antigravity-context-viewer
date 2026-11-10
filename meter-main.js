@@ -14,6 +14,13 @@ const {
   applyUpdateAsync
 } = require('./meter-collector');
 const { isValidExternalUrl } = require('./meter-core');
+const {
+  getUnlockStatus,
+  dryRunUnlock,
+  applyUnlock,
+  restoreUnlock,
+  recoverUnlockTransaction
+} = require('./meter-unlock');
 
 const { applyProxyEnvironment } = require('./meter-proxy');
 
@@ -184,6 +191,41 @@ function registerIpcOnce() {
     } catch (e) {
       return { ok: false, error: e.message };
     }
+  });
+
+  ipcMain.handle('context-meter:unlock-status', async (event, options) => {
+    const url = isLocalMainFrameSender(event);
+    if (!url) throw new Error('仅允许本机主聊天窗口');
+    try { return await getUnlockStatus({ ...(options || {}), runtimeMode: 'electron', binaryPath: undefined }); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('context-meter:unlock-dry-run', async (event, options) => {
+    const url = isLocalMainFrameSender(event);
+    if (!url) throw new Error('仅允许本机主聊天窗口');
+    try { return await dryRunUnlock({ ...(options || {}), runtimeMode: 'electron', binaryPath: undefined }); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('context-meter:unlock-apply', async (event, options) => {
+    const url = isLocalMainFrameSender(event);
+    if (!url) throw new Error('仅允许本机主聊天窗口');
+    try { return await applyUnlock({ ...(options || {}), runtimeMode: 'electron', binaryPath: undefined }); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('context-meter:unlock-restore', async (event, options) => {
+    const url = isLocalMainFrameSender(event);
+    if (!url) throw new Error('仅允许本机主聊天窗口');
+    try { return await restoreUnlock({ ...(options || {}), runtimeMode: 'electron', binaryPath: undefined }); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('context-meter:unlock-recover', async (event, options) => {
+    const url = isLocalMainFrameSender(event);
+    if (!url) throw new Error('仅允许本机主聊天窗口');
+    try { return await recoverUnlockTransaction({ ...(options || {}), runtimeMode: 'electron', binaryPath: undefined }); }
+    catch (e) { return { ok: false, error: e.message }; }
   });
 }
 

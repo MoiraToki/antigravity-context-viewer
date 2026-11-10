@@ -14,10 +14,29 @@ const {
   launchCliSession
 } = require('./meter-collector');
 const { getStateDir } = require('./asar-engine');
+const {
+  getUnlockStatus,
+  dryRunUnlock,
+  applyUnlock,
+  restoreUnlock,
+  recoverUnlockTransaction
+} = require('./meter-unlock');
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1MB 传输体积上限
 const MAX_RECORD_CALLS = 500; // 单批次最大记录数
-const ALLOWED_ROUTES = ['/scan', '/token-history', '/record-calls', '/get-settings', '/save-settings', '/launch-cli'];
+const ALLOWED_ROUTES = [
+  '/scan',
+  '/token-history',
+  '/record-calls',
+  '/get-settings',
+  '/save-settings',
+  '/launch-cli',
+  '/unlock-status',
+  '/unlock-dry-run',
+  '/unlock-apply',
+  '/unlock-restore',
+  '/unlock-recover'
+];
 
 (async () => {
   const api = await connect();
@@ -93,6 +112,36 @@ const ALLOWED_ROUTES = ['/scan', '/token-history', '/record-calls', '/get-settin
           const data = await collectTokenHistoryAsync({ force: request.force === true });
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ ok: true, data }));
+          return;
+        }
+        if (req.url === '/unlock-status') {
+          const result = await getUnlockStatus({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify(result));
+          return;
+        }
+        if (req.url === '/unlock-dry-run') {
+          const result = await dryRunUnlock({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify(result));
+          return;
+        }
+        if (req.url === '/unlock-apply') {
+          const result = await applyUnlock({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify(result));
+          return;
+        }
+        if (req.url === '/unlock-restore') {
+          const result = await restoreUnlock({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify(result));
+          return;
+        }
+        if (req.url === '/unlock-recover') {
+          const result = await recoverUnlockTransaction({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify(result));
           return;
         }
         const data = await collect(api.origin, request.id, { force: request.force === true });

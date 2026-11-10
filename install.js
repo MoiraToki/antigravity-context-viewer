@@ -247,7 +247,7 @@ async function install(options = {}) {
       const regex = /\r?\n?\/\/ Context Meter v2: narrow read-only conversation scan API\r?\nelectron_1\.contextBridge\.exposeInMainWorld\("contextMeterAPI",\s*\{[\s\S]*?\}\);\r?\n?/g;
       preloadContent = preloadContent.replace(regex, '\n');
     }
-    preloadContent += `\n${preloadMarker}\nelectron_1.contextBridge.exposeInMainWorld("contextMeterAPI", { scan: (id, force) => electron_1.ipcRenderer.invoke("context-meter:scan", id, force === true), getTokenHistory: (force) => electron_1.ipcRenderer.invoke("context-meter:token-history", force === true), syncOverlay: (opts) => electron_1.ipcRenderer.invoke("context-meter:sync-overlay", opts), recordCalls: (calls) => electron_1.ipcRenderer.invoke("context-meter:record-calls", calls), getSettings: (opts) => electron_1.ipcRenderer.invoke("context-meter:get-settings", opts), saveSettings: (payload) => electron_1.ipcRenderer.invoke("context-meter:save-settings", payload), launchCli: (opts) => electron_1.ipcRenderer.invoke("context-meter:launch-cli", opts), checkUpdate: (opts) => electron_1.ipcRenderer.invoke("context-meter:check-update", opts), applyUpdate: (opts) => electron_1.ipcRenderer.invoke("context-meter:apply-update", opts), openExternal: (url) => electron_1.ipcRenderer.invoke("context-meter:open-external", url) });\n`;
+    preloadContent += `\n${preloadMarker}\nelectron_1.contextBridge.exposeInMainWorld("contextMeterAPI", { scan: (id, force) => electron_1.ipcRenderer.invoke("context-meter:scan", id, force === true), getTokenHistory: (force) => electron_1.ipcRenderer.invoke("context-meter:token-history", force === true), syncOverlay: (opts) => electron_1.ipcRenderer.invoke("context-meter:sync-overlay", opts), recordCalls: (calls) => electron_1.ipcRenderer.invoke("context-meter:record-calls", calls), getSettings: (opts) => electron_1.ipcRenderer.invoke("context-meter:get-settings", opts), saveSettings: (payload) => electron_1.ipcRenderer.invoke("context-meter:save-settings", payload), launchCli: (opts) => electron_1.ipcRenderer.invoke("context-meter:launch-cli", opts), checkUpdate: (opts) => electron_1.ipcRenderer.invoke("context-meter:check-update", opts), applyUpdate: (opts) => electron_1.ipcRenderer.invoke("context-meter:apply-update", opts), openExternal: (url) => electron_1.ipcRenderer.invoke("context-meter:open-external", url), getUnlockStatus: (opts) => electron_1.ipcRenderer.invoke("context-meter:unlock-status", opts), dryRunUnlock: (opts) => electron_1.ipcRenderer.invoke("context-meter:unlock-dry-run", opts), applyUnlock: (opts) => electron_1.ipcRenderer.invoke("context-meter:unlock-apply", opts), restoreUnlock: (opts) => electron_1.ipcRenderer.invoke("context-meter:unlock-restore", opts), recoverUnlock: (opts) => electron_1.ipcRenderer.invoke("context-meter:unlock-recover", opts) });\n`;
     fs.writeFileSync(preloadPath, preloadContent);
 
     const additions = [
@@ -258,6 +258,7 @@ async function install(options = {}) {
       'meter-storage.js',
       'meter-proxy.js',
       'meter-cli-launcher.js',
+      'meter-unlock.js',
       'local-api.js',
       'attachment_scan.py'
     ];

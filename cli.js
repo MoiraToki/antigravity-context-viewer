@@ -18,6 +18,13 @@ const { loadAsarEngine, getStateDir } = require('./asar-engine');
 const { install, findAsarPath, tryHotInject } = require('./install');
 const { restore } = require('./restore');
 const { resolvePython } = require('./meter-collector');
+const {
+  getUnlockStatus,
+  dryRunUnlock,
+  applyUnlock,
+  restoreUnlock,
+  recoverUnlockTransaction
+} = require('./meter-unlock');
 
 const asar = loadAsarEngine();
 const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -158,6 +165,35 @@ async function cmdCheck(customPath) {
   console.log('✅ 环境预检通过！');
 }
 
+async function cmdUnlock(args) {
+  const binIdx = args.indexOf('--binary');
+  const binaryPath = binIdx >= 0 ? args[binIdx + 1] : null;
+  const isDryRun = args.includes('--dry-run');
+  const positional = args.filter((a, idx) => {
+    if (a.startsWith('-')) return false;
+    if (binIdx >= 0 && idx === binIdx + 1) return false;
+    return a.toLowerCase() !== 'unlock';
+  });
+  const sub = (positional[0] || 'status').toLowerCase();
+  const opts = { runtimeMode: 'cli', binaryPath };
+
+  let res;
+  if (sub === 'status') {
+    res = await getUnlockStatus(opts);
+  } else if (sub === 'recover') {
+    res = await recoverUnlockTransaction(opts);
+  } else if (sub === 'restore') {
+    res = isDryRun ? await dryRunUnlock({ ...opts, mode: '256k' }) : await restoreUnlock(opts);
+  } else {
+    res = isDryRun ? await dryRunUnlock({ ...opts, mode: sub }) : await applyUnlock({ ...opts, mode: sub });
+  }
+  console.log(JSON.stringify(res, null, 2));
+  if (!res || res.ok === false) {
+    process.exitCode = 1;
+  }
+  return res;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const cmd = (args.find(a => !a.startsWith('-')) || 'install').toLowerCase();
@@ -183,13 +219,16 @@ async function main() {
     await cmdStatus(customPath);
   } else if (cmd === 'check') {
     await cmdCheck(customPath);
+  } else if (cmd === 'unlock') {
+    await cmdUnlock(args);
   } else {
     console.log(`用法:
   node cli.js install [--path <app.asar>]   一键持久化安装并热注入当前运行窗口
   node cli.js live                          免改盘 CDP 热挂载到当前运行窗口
   node cli.js status                        查看安装状态与当前对话实时上下文用量
   node cli.js check                         执行前置环境健康检查
-  node cli.js restore                       一键无损卸载并恢复备份`);
+  node cli.js restore                       一键无损卸载并恢复备份
+  node cli.js unlock [status|256k|512k|1m|unlimited|<K>|restore|recover] [--dry-run] [--binary <path>]`);
   }
 }
 
@@ -200,4 +239,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { cmdStatus, cmdCheck };
+module.exports = { cmdStatus, cmdCheck, cmdUnlock };

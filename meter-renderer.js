@@ -1173,6 +1173,83 @@
     .pop-det-val{font-size:11px;font-weight:500;color:var(--ag-pop-sub);font-variant-numeric:tabular-nums;white-space:nowrap}
     .pop-det-trans{font-size:9.5px;color:var(--ag-pop-muted);opacity:0.88;white-space:nowrap;line-height:1.2}
 
+    /* 本地压缩上限配置抽屉样式 */
+    .unlock-card{
+      background:var(--ag-bg-card);border:1px solid var(--ag-border-card);border-radius:8px;
+      padding:10px 11px;display:flex;flex-direction:column;gap:9px;
+    }
+    .unlock-status-dl{
+      display:grid;grid-template-columns:96px minmax(0,1fr);gap:5px 10px;margin:0;align-items:baseline;
+      font-size:11px;
+    }
+    .unlock-status-dl dt{color:var(--ag-text-muted);white-space:nowrap}
+    .unlock-status-dl dd{margin:0;color:var(--ag-text-primary);font-weight:500;word-break:break-all}
+    .unlock-path-val{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;color:var(--ag-text-secondary);line-height:1.35}
+    .unlock-tier-section{
+      border-top:1px solid var(--ag-border-subtle);padding-top:8px;display:flex;flex-direction:column;gap:6px;
+    }
+    .unlock-section-lbl{font-size:10.5px;color:var(--ag-text-muted);line-height:1.35}
+    .unlock-tier-bar{
+      display:flex;flex-wrap:wrap;gap:4px;background:var(--ag-bg-subcard);
+      border:1px solid var(--ag-border-subcard);border-radius:6px;padding:3px;
+    }
+    .unlock-custom-row{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding:5px 8px;border-radius:6px;background:var(--ag-bg-subcard);border:1px solid var(--ag-border-subcard);
+    }
+    .unlock-custom-lbl{font-size:10.5px;color:var(--ag-text-secondary)}
+    .unlock-custom-input{
+      width:76px;padding:2px 6px;border-radius:4px;border:1px solid var(--ag-border-card);
+      background:var(--ag-bg-panel);color:var(--ag-text-primary);font-size:11px;font-variant-numeric:tabular-nums;
+    }
+    .unlock-actions-row{
+      display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+    }
+    .unlock-btn{
+      padding:4px 9px;border-radius:6px;font-size:11px;font-weight:500;
+      border:1px solid var(--ag-btn-border);background:var(--ag-btn-bg);color:var(--ag-text-secondary);
+      cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease;
+    }
+    .unlock-btn:hover:not(:disabled){
+      background:var(--ag-btn-hover);color:var(--ag-text-primary);border-color:var(--ag-border-card);
+    }
+    .unlock-btn:disabled{opacity:0.48;cursor:not-allowed}
+    .unlock-btn-primary{
+      background:rgba(167,139,250,0.16);border-color:rgba(167,139,250,0.42);color:var(--ag-text-primary);font-weight:600;
+    }
+    .unlock-btn-primary:hover:not(:disabled){
+      background:rgba(167,139,250,0.26);border-color:rgba(167,139,250,0.65);
+    }
+    .unlock-btn-warn{
+      background:rgba(245,158,11,0.16);border-color:rgba(245,158,11,0.45);color:#fbbf24;font-weight:600;
+    }
+    :host([data-theme="light"]) .unlock-btn-warn{color:#b45309}
+    .unlock-feedback-box{
+      padding:7px 9px;border-radius:6px;font-size:11px;line-height:1.45;
+      background:var(--ag-bg-subcard);border:1px solid var(--ag-border-subcard);color:var(--ag-text-secondary);
+      white-space:pre-wrap;word-break:break-word;
+    }
+    .unlock-feedback-box[data-tone="ok"]{
+      border-color:rgba(16,185,129,0.42);background:rgba(16,185,129,0.10);color:#34d399;
+    }
+    :host([data-theme="light"]) .unlock-feedback-box[data-tone="ok"]{color:#047857}
+    .unlock-feedback-box[data-tone="warn"]{
+      border-color:rgba(245,158,11,0.45);background:rgba(245,158,11,0.10);color:#fbbf24;
+    }
+    :host([data-theme="light"]) .unlock-feedback-box[data-tone="warn"]{color:#b45309}
+    .unlock-feedback-box[data-tone="error"]{
+      border-color:rgba(239,68,68,0.45);background:rgba(239,68,68,0.10);color:#f87171;
+    }
+    :host([data-theme="light"]) .unlock-feedback-box[data-tone="error"]{color:#dc2626}
+    .unlock-side-effect-note{
+      font-size:10px;line-height:1.42;color:var(--ag-text-muted);
+      border-top:1px solid var(--ag-border-subtle);padding-top:7px;
+    }
+    .unlock-side-effect-note code{
+      font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:9.5px;
+      padding:0 3px;border-radius:3px;background:var(--ag-bg-subcard);color:var(--ag-text-secondary);
+    }
+
     @media (prefers-reduced-motion: reduce){
       *,.ag-unit,.ring-fill,.key-bar-fill,.ag-panel,#context-tooltip,.heat-cell,.w-bar-fill{
         transition:none!important;animation:none!important;
@@ -1315,6 +1392,63 @@
           </div>
         </div>
         <div id="speed-takeaway" class="key-takeaway">等待首次模型输出产生速度统计…</div>
+      </div>
+
+      <!-- 二级交互折叠区 0: 本地压缩上限配置 (Windows x64 language_server.exe 补丁与还原) -->
+      <div id="unlock-drawer" class="tech-drawer">
+        <button id="btn-toggle-unlock" class="drawer-trigger" aria-expanded="false" type="button">
+          <span class="drawer-trigger-left">
+            <span>🔓 本地压缩上限配置</span>
+            <span id="unlock-header-pill" class="key-pill pill-muted" style="font-size:10px;padding:1px 6px;">检测中</span>
+          </span>
+          <span id="unlock-drawer-arrow" class="drawer-arrow">▼ 展开设置</span>
+        </button>
+        <div id="unlock-drawer-body" class="drawer-body" style="display:none;">
+          <div class="unlock-card">
+            <dl class="unlock-status-dl">
+              <dt>当前磁盘状态</dt>
+              <dd id="unlock-disk-status">尚未读取状态</dd>
+              <dt>同构建原版备份</dt>
+              <dd id="unlock-backup-status">—</dd>
+              <dt>运行生效状态</dt>
+              <dd id="unlock-runtime-status">—</dd>
+              <dt>目标二进制路径</dt>
+              <dd id="unlock-target-path" class="unlock-path-val">—</dd>
+            </dl>
+
+            <div class="unlock-tier-section">
+              <div class="unlock-section-lbl">目标压缩上限档位（仅修改本地 Checkpoint Cap，不改变服务端模型最大容量）：</div>
+              <div class="unlock-tier-bar" role="radiogroup" aria-label="本地压缩上限档位">
+                <button id="unlock-tier-256k" class="switch-pill-btn active" type="button" data-tier="256k">256K 默认</button>
+                <button id="unlock-tier-512k" class="switch-pill-btn" type="button" data-tier="512k">512K (v4)</button>
+                <button id="unlock-tier-1m" class="switch-pill-btn" type="button" data-tier="1m" title="1,000,000 tokens">1M (1000K)</button>
+                <button id="unlock-tier-unlimited" class="switch-pill-btn" type="button" data-tier="unlimited">取消本地封顶 (v3)</button>
+                <button id="unlock-tier-custom" class="switch-pill-btn" type="button" data-tier="custom">自定义…</button>
+              </div>
+              <div id="unlock-custom-row" class="unlock-custom-row" style="display:none;">
+                <label for="unlock-custom-k-input" class="unlock-custom-lbl">自定义上限 (64–4096 K, 1K = 1024 tokens)：</label>
+                <div style="display:flex;align-items:center;gap:4px;">
+                  <input id="unlock-custom-k-input" class="unlock-custom-input" type="number" min="64" max="4096" step="1" value="768" aria-label="自定义上限 K 值" />
+                  <span style="font-size:11px;color:var(--ag-text-muted);font-weight:600;">K</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="unlock-actions-row">
+              <button id="btn-unlock-dry-run" class="unlock-btn" type="button">🔍 预检 (Dry-Run)</button>
+              <button id="btn-unlock-apply" class="unlock-btn unlock-btn-primary" type="button">⚡ 应用所选档位</button>
+              <button id="btn-unlock-restore" class="unlock-btn" type="button">↩ 完整还原原版 (.bak)</button>
+              <button id="btn-unlock-recover" class="unlock-btn unlock-btn-warn" type="button" style="display:none;">🛠 恢复中断事务</button>
+              <button id="btn-unlock-refresh" class="unlock-btn" type="button" title="刷新磁盘二进制与备份状态">↻ 刷新</button>
+            </div>
+
+            <div id="unlock-feedback-box" class="unlock-feedback-box" data-tone="info" style="display:none;" role="status" aria-live="polite"></div>
+
+            <div id="unlock-side-effect-note" class="unlock-side-effect-note">
+              <strong>⚠ 机制与副作用说明：</strong>实际触发上下文压缩的阈值为 <code>min(模型真实预算, 本地档位)</code>（例如 Gemini 1M 模型默认被本地 256K 截断；调至 512K/1M 后按设置值触发；若模型自身上限仅 200K，则调高本地档位不会突破 200K）。启用非 256K 档位会同时将 <code>selectCheckpointExperimentKey</code> (Gate 3B) 置为 NOP，跳过整段实验分支，可能影响同分支下的其他实验项。修改磁盘文件后，<strong>必须完全退出并重启 Antigravity 客户端</strong>，新启动的 <code>language_server.exe</code> 进程才会加载新上限。
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- 二级交互折叠区 1: 面板背景与指标颜色自定义（就近放置于面板 B 内部） -->
@@ -3671,6 +3805,9 @@
       bTokens.setAttribute('aria-expanded', 'false');
       syncHostStackingElevation(true);
       positionFloatingPanels();
+      if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.getUnlockStatus === 'function') {
+        void refreshUnlockStatus();
+      }
     } else {
       setPlanDetailExpanded(false, { skipReposition: true });
       pContext.hidden = true;
@@ -5592,6 +5729,355 @@ function closeAllDropdowns(exceptWrap = null) {
   el('badge-tokens').addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
   el('badge-speed')?.addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
 
+  // 二级抽屉 0（面板 B 内）: 本地压缩上限配置抽屉与操作控制器
+  const btnUnlock = el('btn-toggle-unlock');
+  const unlockDrawerBody = el('unlock-drawer-body');
+  const unlockDrawerArrow = el('unlock-drawer-arrow');
+  let selectedUnlockTier = '512k';
+  let unlockCustomK = 768;
+  let unlockBusy = false;
+  let lastUnlockStatus = null;
+  let lastUnlockActionResult = null;
+  let userPickedUnlockTier = false;
+
+  const UNLOCK_ACTION_MAP = {
+    status: { apiMethod: 'getUnlockStatus', route: '/unlock-status' },
+    'dry-run': { apiMethod: 'dryRunUnlock', route: '/unlock-dry-run' },
+    apply: { apiMethod: 'applyUnlock', route: '/unlock-apply' },
+    restore: { apiMethod: 'restoreUnlock', route: '/unlock-restore' },
+    recover: { apiMethod: 'recoverUnlock', route: '/unlock-recover' }
+  };
+
+  async function callUnlockApi(action, payload = {}) {
+    const spec = UNLOCK_ACTION_MAP[action];
+    if (!spec) return { ok: false, code: 'UNKNOWN_UNLOCK_ACTION', error: `未知操作: ${action}` };
+    try {
+      if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.[spec.apiMethod] === 'function') {
+        return await window.contextMeterAPI[spec.apiMethod](payload);
+      }
+      if (typeof window !== 'undefined' && window.__AGContextMeterLive?.port) {
+        const live = window.__AGContextMeterLive;
+        const r = await fetch(`http://127.0.0.1:${live.port}${spec.route}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-AG-Context-Token': live.token },
+          body: JSON.stringify(payload || {})
+        });
+        return await r.json().catch(() => ({ ok: false, code: 'HTTP_ERROR', error: `HTTP ${r.status}` }));
+      }
+      return { ok: false, code: 'NO_BRIDGE', error: '本地桥接服务未连接，请执行 node cli.js install 或重启客户端' };
+    } catch (err) {
+      return { ok: false, code: 'BRIDGE_EXCEPTION', error: err?.message || '调用本地补丁接口失败' };
+    }
+  }
+
+  function selectUnlockTier(tier, customKVal) {
+    const validTiers = ['256k', '512k', '1m', 'unlimited', 'custom'];
+    const nextTier = validTiers.includes(tier) ? tier : '512k';
+    selectedUnlockTier = nextTier;
+    setPillActive(el('unlock-tier-256k'), nextTier === '256k');
+    setPillActive(el('unlock-tier-512k'), nextTier === '512k');
+    setPillActive(el('unlock-tier-1m'), nextTier === '1m');
+    setPillActive(el('unlock-tier-unlimited'), nextTier === 'unlimited');
+    setPillActive(el('unlock-tier-custom'), nextTier === 'custom');
+
+    const customRow = el('unlock-custom-row');
+    if (customRow) {
+      customRow.style.display = nextTier === 'custom' ? 'flex' : 'none';
+    }
+    const customIn = el('unlock-custom-k-input');
+    if (customKVal !== undefined && Number.isFinite(Number(customKVal))) {
+      unlockCustomK = Math.round(Number(customKVal));
+      if (customIn) customIn.value = String(unlockCustomK);
+    } else if (customIn && customIn.value) {
+      const parsed = Number(customIn.value);
+      if (Number.isFinite(parsed)) unlockCustomK = Math.round(parsed);
+    }
+  }
+
+  function buildCurrentTargetSpec() {
+    if (selectedUnlockTier === 'custom') {
+      const customIn = el('unlock-custom-k-input');
+      const kVal = customIn && customIn.value !== undefined && customIn.value !== ''
+        ? Number(customIn.value)
+        : unlockCustomK;
+      unlockCustomK = kVal;
+      return { tier: 'custom', customK: kVal };
+    }
+    return { tier: selectedUnlockTier };
+  }
+
+  function setUnlockFeedback(message, tone = 'info') {
+    const box = el('unlock-feedback-box');
+    if (!box) return;
+    if (!message) {
+      box.style.display = 'none';
+      box.textContent = '';
+      return;
+    }
+    box.style.display = 'block';
+    box.setAttribute('data-tone', tone);
+    box.textContent = message;
+  }
+
+  function renderUnlockStatus(res) {
+    const headerPill = el('unlock-header-pill');
+    const diskStatusEl = el('unlock-disk-status');
+    const backupStatusEl = el('unlock-backup-status');
+    const runtimeStatusEl = el('unlock-runtime-status');
+    const targetPathEl = el('unlock-target-path');
+    const btnDryRun = el('btn-unlock-dry-run');
+    const btnApply = el('btn-unlock-apply');
+    const btnRestore = el('btn-unlock-restore');
+    const btnRecover = el('btn-unlock-recover');
+    const btnRefresh = el('btn-unlock-refresh');
+
+    if (btnRefresh) btnRefresh.disabled = unlockBusy;
+
+    if (!res) {
+      if (headerPill) { headerPill.textContent = '检测中'; headerPill.className = 'key-pill pill-muted'; }
+      return;
+    }
+
+    if (res.supported === false) {
+      if (headerPill) { headerPill.textContent = '仅支持 Win x64'; headerPill.className = 'key-pill pill-muted'; }
+      if (diskStatusEl) diskStatusEl.textContent = res.error || '当前平台不支持本地二进制补丁（仅支持 Windows x64）';
+      if (backupStatusEl) backupStatusEl.textContent = '不适用';
+      if (runtimeStatusEl) runtimeStatusEl.textContent = '不适用';
+      if (targetPathEl) targetPathEl.textContent = '—';
+      if (btnDryRun) btnDryRun.disabled = true;
+      if (btnApply) btnApply.disabled = true;
+      if (btnRestore) btnRestore.disabled = true;
+      if (btnRecover) btnRecover.style.display = 'none';
+      return;
+    }
+
+    if (targetPathEl) {
+      targetPathEl.textContent = res.targetPath || '—';
+    }
+
+    if (!res.ok) {
+      const isNoBridge = res.code === 'NO_BRIDGE';
+      if (headerPill) {
+        headerPill.textContent = res.needsRecovery ? '⚠ 事务待恢复' : (isNoBridge ? '未连接' : '状态异常');
+        headerPill.className = res.needsRecovery ? 'key-pill pill-warn' : (isNoBridge ? 'key-pill pill-muted' : 'key-pill pill-danger');
+      }
+      if (diskStatusEl) diskStatusEl.textContent = res.error || res.code || '读取状态失败';
+      if (backupStatusEl) backupStatusEl.textContent = res.backup?.valid ? '✔ 同构建备份有效' : (res.backup?.exists ? '已存在备份文件' : '—');
+      if (runtimeStatusEl) runtimeStatusEl.textContent = '—';
+      if (btnDryRun) btnDryRun.disabled = true;
+      if (btnApply) btnApply.disabled = true;
+      if (btnRestore) btnRestore.disabled = unlockBusy || !res.canRestore;
+      if (btnRecover) {
+        btnRecover.style.display = res.needsRecovery ? 'inline-block' : 'none';
+        btnRecover.disabled = unlockBusy;
+      }
+      return;
+    }
+
+    // res.ok === true
+    if (headerPill) {
+      if (res.needsRecovery) {
+        headerPill.textContent = '⚠ 事务待恢复';
+        headerPill.className = 'key-pill pill-warn';
+      } else if (res.runtimeState === 'pending_restart') {
+        headerPill.textContent = `⏳ 待重启 (${res.tierLabel || res.tierKey || '已修改'})`;
+        headerPill.className = 'key-pill pill-warn';
+      } else if (res.overallState === 'ORIGINAL_256K') {
+        headerPill.textContent = '磁盘: 256K 默认';
+        headerPill.className = 'key-pill pill-muted';
+      } else if (res.overallState === 'PATCHED_VERIFIED') {
+        headerPill.textContent = `磁盘: ${res.tierLabel || res.tierKey}`;
+        headerPill.className = 'key-pill pill-good';
+      } else if (res.overallState === 'PATCHED_UNVERIFIED_READONLY') {
+        headerPill.textContent = `只读: ${res.tierLabel || '外部补丁'}`;
+        headerPill.className = 'key-pill pill-warn';
+      } else {
+        headerPill.textContent = '状态异常';
+        headerPill.className = 'key-pill pill-danger';
+      }
+    }
+
+    if (diskStatusEl) {
+      const g3a = res.gate3A?.state || '—';
+      const g3b = res.gate3B?.state || '—';
+      diskStatusEl.textContent = `${res.tierLabel || res.overallState || '未知'} (Gate 3A: ${g3a}, Gate 3B: ${g3b})`;
+    }
+
+    if (backupStatusEl) {
+      if (res.backup?.valid) {
+        backupStatusEl.textContent = '✔ 已验证同构建原版 .bak（支持任意档位切换与 100% 原版还原）';
+      } else if (res.overallState === 'ORIGINAL_256K') {
+        backupStatusEl.textContent = '尚未创建（首次应用补丁时将在锁内自动建立同构建 .bak）';
+      } else if (res.backup?.exists) {
+        backupStatusEl.textContent = `✖ 备份校验未通过 (${res.backup.reason || '非同构建版本'})，已禁止写入与还原`;
+      } else {
+        backupStatusEl.textContent = '⚠ 缺失同构建 .bak（外部补丁无法确认 Gate 3B 原始长度，当前仅只读展示）';
+      }
+    }
+
+    if (runtimeStatusEl) {
+      let rtText = res.runtimeState === 'pending_restart'
+        ? '⏳ 磁盘二进制已修改，请完全退出并重启 Antigravity 客户端后生效'
+        : '未知（仅反映磁盘文件状态；重启客户端后由新启动的 language_server.exe 加载）';
+      if (res.cleanupState?.committedOldFiles > 0) {
+        rtText += ` · 历史热替换残留 .old 文件 ${res.cleanupState.committedOldFiles} 个（下次空闲时自动清理）`;
+      }
+      runtimeStatusEl.textContent = rtText;
+    }
+
+    if (!userPickedUnlockTier && res.tierKey) {
+      const mapped = res.tierKey === 'original_256k' ? '256k' : res.tierKey;
+      if (['256k', '512k', '1m', 'unlimited', 'custom'].includes(mapped)) {
+        const customKFromCap = (mapped === 'custom' && res.capTokens) ? Math.round(res.capTokens / 1024) : undefined;
+        selectUnlockTier(mapped, customKFromCap);
+      }
+    }
+
+    if (btnDryRun) btnDryRun.disabled = unlockBusy || !res.canWrite;
+    if (btnApply) btnApply.disabled = unlockBusy || !res.canWrite;
+    if (btnRestore) btnRestore.disabled = unlockBusy || !res.canRestore;
+    if (btnRecover) {
+      btnRecover.style.display = res.needsRecovery ? 'inline-block' : 'none';
+      btnRecover.disabled = unlockBusy;
+    }
+  }
+
+  async function refreshUnlockStatus() {
+    const res = await callUnlockApi('status', {});
+    lastUnlockStatus = res;
+    renderUnlockStatus(res);
+    return res;
+  }
+
+  async function triggerUnlockDryRun() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const target = buildCurrentTargetSpec();
+      const res = await callUnlockApi('dry-run', { target });
+      lastUnlockActionResult = res;
+      if (res?.ok) {
+        if (lastUnlockStatus && res.beforeSha256) {
+          lastUnlockStatus.currentSha256 = res.beforeSha256;
+          if (res.instanceIdentity) lastUnlockStatus.instanceIdentity = res.instanceIdentity;
+        }
+        const g3aHex = res.gate3A?.patchVA != null ? `0x${Number(res.gate3A.patchVA).toString(16)}` : '—';
+        const g3bHex = res.gate3B?.patchVA != null ? `0x${Number(res.gate3B.patchVA).toString(16)}` : '—';
+        const changeTxt = res.willChange ? '将写入新机器码并自动维护同构建 .bak' : '当前磁盘文件已处于该档位（无需重复写入）';
+        setUnlockFeedback(`✔ 预检通过：目标档位 [${res.targetSpec?.label || target.tier}] · Gate 3A (${g3aHex}) · Gate 3B (${g3bHex}, ${res.gate3B?.patchLength || '?'}B) · ${changeTxt}`, 'ok');
+      } else {
+        setUnlockFeedback(`✖ 预检未通过 (${res?.code || 'ERROR'})：${res?.error || '未知原因'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  async function triggerUnlockApply() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const target = buildCurrentTargetSpec();
+      const res = await callUnlockApi('apply', {
+        target,
+        expectedBeforeSha256: lastUnlockStatus?.currentSha256 || undefined,
+        expectedInstanceIdentity: lastUnlockStatus?.instanceIdentity || undefined
+      });
+      lastUnlockActionResult = res;
+      await refreshUnlockStatus();
+      if (res?.ok) {
+        if (res.changed === false) {
+          setUnlockFeedback(`ℹ 当前磁盘二进制已处于所选档位 (${res.targetSpec?.label || target.tier})，无需重复写入。`, 'info');
+        } else {
+          const stratLabel = res.strategy === 'hot_rename' ? 'NTFS 热重命名替换（运行中进程免关闭写入）' : '直接替换';
+          setUnlockFeedback(`✅ 已成功应用档位 [${res.targetSpec?.label || target.tier}]（方式：${stratLabel}）。请完全退出并重启 Antigravity 客户端以使新压缩上限生效！`, 'ok');
+        }
+      } else {
+        setUnlockFeedback(`✖ 应用补丁失败 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  async function triggerUnlockRestore() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const res = await callUnlockApi('restore', {});
+      lastUnlockActionResult = res;
+      await refreshUnlockStatus();
+      if (res?.ok) {
+        userPickedUnlockTier = false;
+        selectUnlockTier('256k');
+        setUnlockFeedback('✅ 已从同构建 .bak 完整还原为官方 256K 原版！请完全退出并重启 Antigravity 客户端后生效。', 'ok');
+      } else {
+        setUnlockFeedback(`✖ 还原失败 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  async function triggerUnlockRecover() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const res = await callUnlockApi('recover', {});
+      lastUnlockActionResult = res;
+      await refreshUnlockStatus();
+      if (res?.ok) {
+        setUnlockFeedback(`✅ 事务恢复完成${res.noop ? '（无需额外恢复动作）' : ''}！`, 'ok');
+      } else {
+        setUnlockFeedback(`✖ 事务恢复未完成 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  function toggleUnlockDrawer(forceOpen) {
+    if (!unlockDrawerBody) return;
+    const isHidden = unlockDrawerBody.style.display === 'none' || !unlockDrawerBody.style.display;
+    const nextOpen = typeof forceOpen === 'boolean' ? forceOpen : isHidden;
+    unlockDrawerBody.style.display = nextOpen ? 'block' : 'none';
+    if (unlockDrawerArrow) unlockDrawerArrow.textContent = nextOpen ? '▲ 收起设置' : '▼ 展开设置';
+    btnUnlock?.setAttribute('aria-expanded', String(nextOpen));
+    if (nextOpen) {
+      void refreshUnlockStatus();
+    }
+    positionFloatingPanels();
+  }
+
+  btnUnlock?.addEventListener('click', () => toggleUnlockDrawer());
+  ['256k', '512k', '1m', 'unlimited', 'custom'].forEach(tKey => {
+    el(`unlock-tier-${tKey}`)?.addEventListener('click', () => {
+      userPickedUnlockTier = true;
+      selectUnlockTier(tKey);
+    });
+  });
+  el('unlock-custom-k-input')?.addEventListener('input', e => {
+    const val = Number(e?.target?.value ?? el('unlock-custom-k-input')?.value);
+    if (Number.isFinite(val)) unlockCustomK = Math.round(val);
+  });
+  el('btn-unlock-dry-run')?.addEventListener('click', () => { void triggerUnlockDryRun(); });
+  el('btn-unlock-apply')?.addEventListener('click', () => { void triggerUnlockApply(); });
+  el('btn-unlock-restore')?.addEventListener('click', () => { void triggerUnlockRestore(); });
+  el('btn-unlock-recover')?.addEventListener('click', () => { void triggerUnlockRecover(); });
+  el('btn-unlock-refresh')?.addEventListener('click', () => { void refreshUnlockStatus(); });
+
   // 二级抽屉 1（面板 B 内）: 指标与背景颜色自定义抽屉折叠展开
   const btnColors = el('btn-toggle-colors');
   const colorDrawerBody = el('color-drawer-body');
@@ -6105,6 +6591,12 @@ function closeAllDropdowns(exceptWrap = null) {
       if (colorDrawer && colorDrawer.style.display !== 'none') {
         toggleColorsDrawer(false);
         btnColors?.focus?.();
+        return;
+      }
+      const unlockDrawer = el('unlock-drawer-body');
+      if (unlockDrawer && unlockDrawer.style.display !== 'none') {
+        toggleUnlockDrawer(false);
+        btnUnlock?.focus?.();
         return;
       }
       toggle(false);
@@ -8029,6 +8521,20 @@ function renderHeatmapGrid(forceRebuild = false) {
     restoreSettingsFromHost,
     launchCli: opts => triggerLaunchCli(opts),
     getLastCliLaunchResult: () => lastCliLaunchResult,
+    refreshUnlockStatus: () => refreshUnlockStatus(),
+    toggleUnlockDrawer: open => toggleUnlockDrawer(open),
+    selectUnlockTier: (tier, customK) => { userPickedUnlockTier = true; selectUnlockTier(tier, customK); },
+    dryRunUnlock: () => triggerUnlockDryRun(),
+    applyUnlock: () => triggerUnlockApply(),
+    restoreUnlock: () => triggerUnlockRestore(),
+    recoverUnlock: () => triggerUnlockRecover(),
+    getUnlockUiState: () => ({
+      selectedTier: selectedUnlockTier,
+      customK: unlockCustomK,
+      lastStatus: lastUnlockStatus,
+      lastActionResult: lastUnlockActionResult,
+      busy: unlockBusy
+    }),
     getTimelineWindow: () => {
       const w = computeTimelineWindow();
       return {

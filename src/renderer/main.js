@@ -692,6 +692,9 @@
       bTokens.setAttribute('aria-expanded', 'false');
       syncHostStackingElevation(true);
       positionFloatingPanels();
+      if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.getUnlockStatus === 'function') {
+        void refreshUnlockStatus();
+      }
     } else {
       setPlanDetailExpanded(false, { skipReposition: true });
       pContext.hidden = true;
@@ -1401,6 +1404,355 @@
   el('badge-tokens').addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
   el('badge-speed')?.addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
 
+  // 二级抽屉 0（面板 B 内）: 本地压缩上限配置抽屉与操作控制器
+  const btnUnlock = el('btn-toggle-unlock');
+  const unlockDrawerBody = el('unlock-drawer-body');
+  const unlockDrawerArrow = el('unlock-drawer-arrow');
+  let selectedUnlockTier = '512k';
+  let unlockCustomK = 768;
+  let unlockBusy = false;
+  let lastUnlockStatus = null;
+  let lastUnlockActionResult = null;
+  let userPickedUnlockTier = false;
+
+  const UNLOCK_ACTION_MAP = {
+    status: { apiMethod: 'getUnlockStatus', route: '/unlock-status' },
+    'dry-run': { apiMethod: 'dryRunUnlock', route: '/unlock-dry-run' },
+    apply: { apiMethod: 'applyUnlock', route: '/unlock-apply' },
+    restore: { apiMethod: 'restoreUnlock', route: '/unlock-restore' },
+    recover: { apiMethod: 'recoverUnlock', route: '/unlock-recover' }
+  };
+
+  async function callUnlockApi(action, payload = {}) {
+    const spec = UNLOCK_ACTION_MAP[action];
+    if (!spec) return { ok: false, code: 'UNKNOWN_UNLOCK_ACTION', error: `未知操作: ${action}` };
+    try {
+      if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.[spec.apiMethod] === 'function') {
+        return await window.contextMeterAPI[spec.apiMethod](payload);
+      }
+      if (typeof window !== 'undefined' && window.__AGContextMeterLive?.port) {
+        const live = window.__AGContextMeterLive;
+        const r = await fetch(`http://127.0.0.1:${live.port}${spec.route}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-AG-Context-Token': live.token },
+          body: JSON.stringify(payload || {})
+        });
+        return await r.json().catch(() => ({ ok: false, code: 'HTTP_ERROR', error: `HTTP ${r.status}` }));
+      }
+      return { ok: false, code: 'NO_BRIDGE', error: '本地桥接服务未连接，请执行 node cli.js install 或重启客户端' };
+    } catch (err) {
+      return { ok: false, code: 'BRIDGE_EXCEPTION', error: err?.message || '调用本地补丁接口失败' };
+    }
+  }
+
+  function selectUnlockTier(tier, customKVal) {
+    const validTiers = ['256k', '512k', '1m', 'unlimited', 'custom'];
+    const nextTier = validTiers.includes(tier) ? tier : '512k';
+    selectedUnlockTier = nextTier;
+    setPillActive(el('unlock-tier-256k'), nextTier === '256k');
+    setPillActive(el('unlock-tier-512k'), nextTier === '512k');
+    setPillActive(el('unlock-tier-1m'), nextTier === '1m');
+    setPillActive(el('unlock-tier-unlimited'), nextTier === 'unlimited');
+    setPillActive(el('unlock-tier-custom'), nextTier === 'custom');
+
+    const customRow = el('unlock-custom-row');
+    if (customRow) {
+      customRow.style.display = nextTier === 'custom' ? 'flex' : 'none';
+    }
+    const customIn = el('unlock-custom-k-input');
+    if (customKVal !== undefined && Number.isFinite(Number(customKVal))) {
+      unlockCustomK = Math.round(Number(customKVal));
+      if (customIn) customIn.value = String(unlockCustomK);
+    } else if (customIn && customIn.value) {
+      const parsed = Number(customIn.value);
+      if (Number.isFinite(parsed)) unlockCustomK = Math.round(parsed);
+    }
+  }
+
+  function buildCurrentTargetSpec() {
+    if (selectedUnlockTier === 'custom') {
+      const customIn = el('unlock-custom-k-input');
+      const kVal = customIn && customIn.value !== undefined && customIn.value !== ''
+        ? Number(customIn.value)
+        : unlockCustomK;
+      unlockCustomK = kVal;
+      return { tier: 'custom', customK: kVal };
+    }
+    return { tier: selectedUnlockTier };
+  }
+
+  function setUnlockFeedback(message, tone = 'info') {
+    const box = el('unlock-feedback-box');
+    if (!box) return;
+    if (!message) {
+      box.style.display = 'none';
+      box.textContent = '';
+      return;
+    }
+    box.style.display = 'block';
+    box.setAttribute('data-tone', tone);
+    box.textContent = message;
+  }
+
+  function renderUnlockStatus(res) {
+    const headerPill = el('unlock-header-pill');
+    const diskStatusEl = el('unlock-disk-status');
+    const backupStatusEl = el('unlock-backup-status');
+    const runtimeStatusEl = el('unlock-runtime-status');
+    const targetPathEl = el('unlock-target-path');
+    const btnDryRun = el('btn-unlock-dry-run');
+    const btnApply = el('btn-unlock-apply');
+    const btnRestore = el('btn-unlock-restore');
+    const btnRecover = el('btn-unlock-recover');
+    const btnRefresh = el('btn-unlock-refresh');
+
+    if (btnRefresh) btnRefresh.disabled = unlockBusy;
+
+    if (!res) {
+      if (headerPill) { headerPill.textContent = '检测中'; headerPill.className = 'key-pill pill-muted'; }
+      return;
+    }
+
+    if (res.supported === false) {
+      if (headerPill) { headerPill.textContent = '仅支持 Win x64'; headerPill.className = 'key-pill pill-muted'; }
+      if (diskStatusEl) diskStatusEl.textContent = res.error || '当前平台不支持本地二进制补丁（仅支持 Windows x64）';
+      if (backupStatusEl) backupStatusEl.textContent = '不适用';
+      if (runtimeStatusEl) runtimeStatusEl.textContent = '不适用';
+      if (targetPathEl) targetPathEl.textContent = '—';
+      if (btnDryRun) btnDryRun.disabled = true;
+      if (btnApply) btnApply.disabled = true;
+      if (btnRestore) btnRestore.disabled = true;
+      if (btnRecover) btnRecover.style.display = 'none';
+      return;
+    }
+
+    if (targetPathEl) {
+      targetPathEl.textContent = res.targetPath || '—';
+    }
+
+    if (!res.ok) {
+      const isNoBridge = res.code === 'NO_BRIDGE';
+      if (headerPill) {
+        headerPill.textContent = res.needsRecovery ? '⚠ 事务待恢复' : (isNoBridge ? '未连接' : '状态异常');
+        headerPill.className = res.needsRecovery ? 'key-pill pill-warn' : (isNoBridge ? 'key-pill pill-muted' : 'key-pill pill-danger');
+      }
+      if (diskStatusEl) diskStatusEl.textContent = res.error || res.code || '读取状态失败';
+      if (backupStatusEl) backupStatusEl.textContent = res.backup?.valid ? '✔ 同构建备份有效' : (res.backup?.exists ? '已存在备份文件' : '—');
+      if (runtimeStatusEl) runtimeStatusEl.textContent = '—';
+      if (btnDryRun) btnDryRun.disabled = true;
+      if (btnApply) btnApply.disabled = true;
+      if (btnRestore) btnRestore.disabled = unlockBusy || !res.canRestore;
+      if (btnRecover) {
+        btnRecover.style.display = res.needsRecovery ? 'inline-block' : 'none';
+        btnRecover.disabled = unlockBusy;
+      }
+      return;
+    }
+
+    // res.ok === true
+    if (headerPill) {
+      if (res.needsRecovery) {
+        headerPill.textContent = '⚠ 事务待恢复';
+        headerPill.className = 'key-pill pill-warn';
+      } else if (res.runtimeState === 'pending_restart') {
+        headerPill.textContent = `⏳ 待重启 (${res.tierLabel || res.tierKey || '已修改'})`;
+        headerPill.className = 'key-pill pill-warn';
+      } else if (res.overallState === 'ORIGINAL_256K') {
+        headerPill.textContent = '磁盘: 256K 默认';
+        headerPill.className = 'key-pill pill-muted';
+      } else if (res.overallState === 'PATCHED_VERIFIED') {
+        headerPill.textContent = `磁盘: ${res.tierLabel || res.tierKey}`;
+        headerPill.className = 'key-pill pill-good';
+      } else if (res.overallState === 'PATCHED_UNVERIFIED_READONLY') {
+        headerPill.textContent = `只读: ${res.tierLabel || '外部补丁'}`;
+        headerPill.className = 'key-pill pill-warn';
+      } else {
+        headerPill.textContent = '状态异常';
+        headerPill.className = 'key-pill pill-danger';
+      }
+    }
+
+    if (diskStatusEl) {
+      const g3a = res.gate3A?.state || '—';
+      const g3b = res.gate3B?.state || '—';
+      diskStatusEl.textContent = `${res.tierLabel || res.overallState || '未知'} (Gate 3A: ${g3a}, Gate 3B: ${g3b})`;
+    }
+
+    if (backupStatusEl) {
+      if (res.backup?.valid) {
+        backupStatusEl.textContent = '✔ 已验证同构建原版 .bak（支持任意档位切换与 100% 原版还原）';
+      } else if (res.overallState === 'ORIGINAL_256K') {
+        backupStatusEl.textContent = '尚未创建（首次应用补丁时将在锁内自动建立同构建 .bak）';
+      } else if (res.backup?.exists) {
+        backupStatusEl.textContent = `✖ 备份校验未通过 (${res.backup.reason || '非同构建版本'})，已禁止写入与还原`;
+      } else {
+        backupStatusEl.textContent = '⚠ 缺失同构建 .bak（外部补丁无法确认 Gate 3B 原始长度，当前仅只读展示）';
+      }
+    }
+
+    if (runtimeStatusEl) {
+      let rtText = res.runtimeState === 'pending_restart'
+        ? '⏳ 磁盘二进制已修改，请完全退出并重启 Antigravity 客户端后生效'
+        : '未知（仅反映磁盘文件状态；重启客户端后由新启动的 language_server.exe 加载）';
+      if (res.cleanupState?.committedOldFiles > 0) {
+        rtText += ` · 历史热替换残留 .old 文件 ${res.cleanupState.committedOldFiles} 个（下次空闲时自动清理）`;
+      }
+      runtimeStatusEl.textContent = rtText;
+    }
+
+    if (!userPickedUnlockTier && res.tierKey) {
+      const mapped = res.tierKey === 'original_256k' ? '256k' : res.tierKey;
+      if (['256k', '512k', '1m', 'unlimited', 'custom'].includes(mapped)) {
+        const customKFromCap = (mapped === 'custom' && res.capTokens) ? Math.round(res.capTokens / 1024) : undefined;
+        selectUnlockTier(mapped, customKFromCap);
+      }
+    }
+
+    if (btnDryRun) btnDryRun.disabled = unlockBusy || !res.canWrite;
+    if (btnApply) btnApply.disabled = unlockBusy || !res.canWrite;
+    if (btnRestore) btnRestore.disabled = unlockBusy || !res.canRestore;
+    if (btnRecover) {
+      btnRecover.style.display = res.needsRecovery ? 'inline-block' : 'none';
+      btnRecover.disabled = unlockBusy;
+    }
+  }
+
+  async function refreshUnlockStatus() {
+    const res = await callUnlockApi('status', {});
+    lastUnlockStatus = res;
+    renderUnlockStatus(res);
+    return res;
+  }
+
+  async function triggerUnlockDryRun() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const target = buildCurrentTargetSpec();
+      const res = await callUnlockApi('dry-run', { target });
+      lastUnlockActionResult = res;
+      if (res?.ok) {
+        if (lastUnlockStatus && res.beforeSha256) {
+          lastUnlockStatus.currentSha256 = res.beforeSha256;
+          if (res.instanceIdentity) lastUnlockStatus.instanceIdentity = res.instanceIdentity;
+        }
+        const g3aHex = res.gate3A?.patchVA != null ? `0x${Number(res.gate3A.patchVA).toString(16)}` : '—';
+        const g3bHex = res.gate3B?.patchVA != null ? `0x${Number(res.gate3B.patchVA).toString(16)}` : '—';
+        const changeTxt = res.willChange ? '将写入新机器码并自动维护同构建 .bak' : '当前磁盘文件已处于该档位（无需重复写入）';
+        setUnlockFeedback(`✔ 预检通过：目标档位 [${res.targetSpec?.label || target.tier}] · Gate 3A (${g3aHex}) · Gate 3B (${g3bHex}, ${res.gate3B?.patchLength || '?'}B) · ${changeTxt}`, 'ok');
+      } else {
+        setUnlockFeedback(`✖ 预检未通过 (${res?.code || 'ERROR'})：${res?.error || '未知原因'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  async function triggerUnlockApply() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const target = buildCurrentTargetSpec();
+      const res = await callUnlockApi('apply', {
+        target,
+        expectedBeforeSha256: lastUnlockStatus?.currentSha256 || undefined,
+        expectedInstanceIdentity: lastUnlockStatus?.instanceIdentity || undefined
+      });
+      lastUnlockActionResult = res;
+      await refreshUnlockStatus();
+      if (res?.ok) {
+        if (res.changed === false) {
+          setUnlockFeedback(`ℹ 当前磁盘二进制已处于所选档位 (${res.targetSpec?.label || target.tier})，无需重复写入。`, 'info');
+        } else {
+          const stratLabel = res.strategy === 'hot_rename' ? 'NTFS 热重命名替换（运行中进程免关闭写入）' : '直接替换';
+          setUnlockFeedback(`✅ 已成功应用档位 [${res.targetSpec?.label || target.tier}]（方式：${stratLabel}）。请完全退出并重启 Antigravity 客户端以使新压缩上限生效！`, 'ok');
+        }
+      } else {
+        setUnlockFeedback(`✖ 应用补丁失败 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  async function triggerUnlockRestore() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const res = await callUnlockApi('restore', {});
+      lastUnlockActionResult = res;
+      await refreshUnlockStatus();
+      if (res?.ok) {
+        userPickedUnlockTier = false;
+        selectUnlockTier('256k');
+        setUnlockFeedback('✅ 已从同构建 .bak 完整还原为官方 256K 原版！请完全退出并重启 Antigravity 客户端后生效。', 'ok');
+      } else {
+        setUnlockFeedback(`✖ 还原失败 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  async function triggerUnlockRecover() {
+    if (unlockBusy) return { ok: false, code: 'BUSY', error: '操作进行中' };
+    unlockBusy = true;
+    renderUnlockStatus(lastUnlockStatus);
+    try {
+      const res = await callUnlockApi('recover', {});
+      lastUnlockActionResult = res;
+      await refreshUnlockStatus();
+      if (res?.ok) {
+        setUnlockFeedback(`✅ 事务恢复完成${res.noop ? '（无需额外恢复动作）' : ''}！`, 'ok');
+      } else {
+        setUnlockFeedback(`✖ 事务恢复未完成 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
+      }
+      return res;
+    } finally {
+      unlockBusy = false;
+      renderUnlockStatus(lastUnlockStatus);
+    }
+  }
+
+  function toggleUnlockDrawer(forceOpen) {
+    if (!unlockDrawerBody) return;
+    const isHidden = unlockDrawerBody.style.display === 'none' || !unlockDrawerBody.style.display;
+    const nextOpen = typeof forceOpen === 'boolean' ? forceOpen : isHidden;
+    unlockDrawerBody.style.display = nextOpen ? 'block' : 'none';
+    if (unlockDrawerArrow) unlockDrawerArrow.textContent = nextOpen ? '▲ 收起设置' : '▼ 展开设置';
+    btnUnlock?.setAttribute('aria-expanded', String(nextOpen));
+    if (nextOpen) {
+      void refreshUnlockStatus();
+    }
+    positionFloatingPanels();
+  }
+
+  btnUnlock?.addEventListener('click', () => toggleUnlockDrawer());
+  ['256k', '512k', '1m', 'unlimited', 'custom'].forEach(tKey => {
+    el(`unlock-tier-${tKey}`)?.addEventListener('click', () => {
+      userPickedUnlockTier = true;
+      selectUnlockTier(tKey);
+    });
+  });
+  el('unlock-custom-k-input')?.addEventListener('input', e => {
+    const val = Number(e?.target?.value ?? el('unlock-custom-k-input')?.value);
+    if (Number.isFinite(val)) unlockCustomK = Math.round(val);
+  });
+  el('btn-unlock-dry-run')?.addEventListener('click', () => { void triggerUnlockDryRun(); });
+  el('btn-unlock-apply')?.addEventListener('click', () => { void triggerUnlockApply(); });
+  el('btn-unlock-restore')?.addEventListener('click', () => { void triggerUnlockRestore(); });
+  el('btn-unlock-recover')?.addEventListener('click', () => { void triggerUnlockRecover(); });
+  el('btn-unlock-refresh')?.addEventListener('click', () => { void refreshUnlockStatus(); });
+
   // 二级抽屉 1（面板 B 内）: 指标与背景颜色自定义抽屉折叠展开
   const btnColors = el('btn-toggle-colors');
   const colorDrawerBody = el('color-drawer-body');
@@ -1914,6 +2266,12 @@
       if (colorDrawer && colorDrawer.style.display !== 'none') {
         toggleColorsDrawer(false);
         btnColors?.focus?.();
+        return;
+      }
+      const unlockDrawer = el('unlock-drawer-body');
+      if (unlockDrawer && unlockDrawer.style.display !== 'none') {
+        toggleUnlockDrawer(false);
+        btnUnlock?.focus?.();
         return;
       }
       toggle(false);
@@ -3082,6 +3440,20 @@
     restoreSettingsFromHost,
     launchCli: opts => triggerLaunchCli(opts),
     getLastCliLaunchResult: () => lastCliLaunchResult,
+    refreshUnlockStatus: () => refreshUnlockStatus(),
+    toggleUnlockDrawer: open => toggleUnlockDrawer(open),
+    selectUnlockTier: (tier, customK) => { userPickedUnlockTier = true; selectUnlockTier(tier, customK); },
+    dryRunUnlock: () => triggerUnlockDryRun(),
+    applyUnlock: () => triggerUnlockApply(),
+    restoreUnlock: () => triggerUnlockRestore(),
+    recoverUnlock: () => triggerUnlockRecover(),
+    getUnlockUiState: () => ({
+      selectedTier: selectedUnlockTier,
+      customK: unlockCustomK,
+      lastStatus: lastUnlockStatus,
+      lastActionResult: lastUnlockActionResult,
+      busy: unlockBusy
+    }),
     getTimelineWindow: () => {
       const w = computeTimelineWindow();
       return {

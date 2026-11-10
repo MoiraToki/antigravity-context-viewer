@@ -1125,6 +1125,83 @@
     .pop-det-val{font-size:11px;font-weight:500;color:var(--ag-pop-sub);font-variant-numeric:tabular-nums;white-space:nowrap}
     .pop-det-trans{font-size:9.5px;color:var(--ag-pop-muted);opacity:0.88;white-space:nowrap;line-height:1.2}
 
+    /* 本地压缩上限配置抽屉样式 */
+    .unlock-card{
+      background:var(--ag-bg-card);border:1px solid var(--ag-border-card);border-radius:8px;
+      padding:10px 11px;display:flex;flex-direction:column;gap:9px;
+    }
+    .unlock-status-dl{
+      display:grid;grid-template-columns:96px minmax(0,1fr);gap:5px 10px;margin:0;align-items:baseline;
+      font-size:11px;
+    }
+    .unlock-status-dl dt{color:var(--ag-text-muted);white-space:nowrap}
+    .unlock-status-dl dd{margin:0;color:var(--ag-text-primary);font-weight:500;word-break:break-all}
+    .unlock-path-val{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;color:var(--ag-text-secondary);line-height:1.35}
+    .unlock-tier-section{
+      border-top:1px solid var(--ag-border-subtle);padding-top:8px;display:flex;flex-direction:column;gap:6px;
+    }
+    .unlock-section-lbl{font-size:10.5px;color:var(--ag-text-muted);line-height:1.35}
+    .unlock-tier-bar{
+      display:flex;flex-wrap:wrap;gap:4px;background:var(--ag-bg-subcard);
+      border:1px solid var(--ag-border-subcard);border-radius:6px;padding:3px;
+    }
+    .unlock-custom-row{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding:5px 8px;border-radius:6px;background:var(--ag-bg-subcard);border:1px solid var(--ag-border-subcard);
+    }
+    .unlock-custom-lbl{font-size:10.5px;color:var(--ag-text-secondary)}
+    .unlock-custom-input{
+      width:76px;padding:2px 6px;border-radius:4px;border:1px solid var(--ag-border-card);
+      background:var(--ag-bg-panel);color:var(--ag-text-primary);font-size:11px;font-variant-numeric:tabular-nums;
+    }
+    .unlock-actions-row{
+      display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+    }
+    .unlock-btn{
+      padding:4px 9px;border-radius:6px;font-size:11px;font-weight:500;
+      border:1px solid var(--ag-btn-border);background:var(--ag-btn-bg);color:var(--ag-text-secondary);
+      cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease;
+    }
+    .unlock-btn:hover:not(:disabled){
+      background:var(--ag-btn-hover);color:var(--ag-text-primary);border-color:var(--ag-border-card);
+    }
+    .unlock-btn:disabled{opacity:0.48;cursor:not-allowed}
+    .unlock-btn-primary{
+      background:rgba(167,139,250,0.16);border-color:rgba(167,139,250,0.42);color:var(--ag-text-primary);font-weight:600;
+    }
+    .unlock-btn-primary:hover:not(:disabled){
+      background:rgba(167,139,250,0.26);border-color:rgba(167,139,250,0.65);
+    }
+    .unlock-btn-warn{
+      background:rgba(245,158,11,0.16);border-color:rgba(245,158,11,0.45);color:#fbbf24;font-weight:600;
+    }
+    :host([data-theme="light"]) .unlock-btn-warn{color:#b45309}
+    .unlock-feedback-box{
+      padding:7px 9px;border-radius:6px;font-size:11px;line-height:1.45;
+      background:var(--ag-bg-subcard);border:1px solid var(--ag-border-subcard);color:var(--ag-text-secondary);
+      white-space:pre-wrap;word-break:break-word;
+    }
+    .unlock-feedback-box[data-tone="ok"]{
+      border-color:rgba(16,185,129,0.42);background:rgba(16,185,129,0.10);color:#34d399;
+    }
+    :host([data-theme="light"]) .unlock-feedback-box[data-tone="ok"]{color:#047857}
+    .unlock-feedback-box[data-tone="warn"]{
+      border-color:rgba(245,158,11,0.45);background:rgba(245,158,11,0.10);color:#fbbf24;
+    }
+    :host([data-theme="light"]) .unlock-feedback-box[data-tone="warn"]{color:#b45309}
+    .unlock-feedback-box[data-tone="error"]{
+      border-color:rgba(239,68,68,0.45);background:rgba(239,68,68,0.10);color:#f87171;
+    }
+    :host([data-theme="light"]) .unlock-feedback-box[data-tone="error"]{color:#dc2626}
+    .unlock-side-effect-note{
+      font-size:10px;line-height:1.42;color:var(--ag-text-muted);
+      border-top:1px solid var(--ag-border-subtle);padding-top:7px;
+    }
+    .unlock-side-effect-note code{
+      font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:9.5px;
+      padding:0 3px;border-radius:3px;background:var(--ag-bg-subcard);color:var(--ag-text-secondary);
+    }
+
     @media (prefers-reduced-motion: reduce){
       *,.ag-unit,.ring-fill,.key-bar-fill,.ag-panel,#context-tooltip,.heat-cell,.w-bar-fill{
         transition:none!important;animation:none!important;
