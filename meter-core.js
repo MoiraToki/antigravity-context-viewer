@@ -1859,7 +1859,7 @@
       const u = new URL(rawUrl);
       if (u.protocol !== 'https:' || u.hostname !== 'github.com') return false;
       const pathname = u.pathname.replace(/\/+$/, '');
-      const repoPrefix = '/elviscjn-cjn/antigravity-context-viewer';
+      const repoPrefix = '/MoiraToki/antigravity-context-viewer';
       return pathname === repoPrefix || pathname.startsWith(repoPrefix + '/');
     } catch {
       return false;

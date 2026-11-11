@@ -1,5 +1,4 @@
 'use strict';
-process.noAsar = true;
 
 const fs = require('fs');
 const os = require('os');
@@ -108,7 +107,10 @@ function classifyCapTokens(capTokens) {
 }
 
 function normalizeTargetSpec(input = {}) {
-  const rawMode = String(input.mode || input.tier || '512k').trim().toLowerCase();
+  const src = (input && input.mode == null && input.tier == null && input.target && typeof input.target === 'object')
+    ? input.target
+    : (input || {});
+  const rawMode = String(src.mode || src.tier || '512k').trim().toLowerCase();
   if (rawMode === '256k' || rawMode === 'default' || rawMode === '256000') {
     return { ...PRESET_MODES['256k'] };
   }
@@ -123,12 +125,12 @@ function normalizeTargetSpec(input = {}) {
   }
   let capTokens = null;
   if (rawMode === 'custom') {
-    if (input.capTokens != null) {
-      capTokens = Number(input.capTokens);
-    } else if (input.customCapTokens != null) {
-      capTokens = Number(input.customCapTokens);
-    } else if (input.customK != null) {
-      capTokens = Number(input.customK) * 1000;
+    if (src.capTokens != null) {
+      capTokens = Number(src.capTokens);
+    } else if (src.customCapTokens != null) {
+      capTokens = Number(src.customCapTokens);
+    } else if (src.customK != null) {
+      capTokens = Number(src.customK) * 1000;
     }
   } else {
     const mK = rawMode.match(/^(\d+)k$/i);
@@ -146,6 +148,34 @@ function normalizeTargetSpec(input = {}) {
     );
   }
   return classifyCapTokens(capTokens);
+}
+
+/**
+ * 清洗来自 IPC / HTTP 桥接层的外部参数，严格白名单过滤，阻断覆盖内部测试与运行时钩子
+ */
+function sanitizePublicUnlockOptions(rawInput = {}, fixedOverrides = {}) {
+  const raw = (rawInput && typeof rawInput === 'object') ? rawInput : {};
+  const specSrc = (raw.mode == null && raw.tier == null && raw.target && typeof raw.target === 'object')
+    ? raw.target
+    : raw;
+  const clean = {};
+  if (specSrc.mode !== undefined) clean.mode = specSrc.mode;
+  if (specSrc.tier !== undefined) clean.tier = specSrc.tier;
+  if (specSrc.capTokens !== undefined) clean.capTokens = specSrc.capTokens;
+  if (specSrc.customCapTokens !== undefined) clean.customCapTokens = specSrc.customCapTokens;
+  if (specSrc.customK !== undefined) clean.customK = specSrc.customK;
+  if (raw.force === true) clean.force = true;
+  if (typeof raw.expectedBeforeSha256 === 'string' && raw.expectedBeforeSha256.trim()) {
+    clean.expectedBeforeSha256 = raw.expectedBeforeSha256.trim();
+  }
+  if (raw.expectedInstanceIdentity && typeof raw.expectedInstanceIdentity === 'object') {
+    const id = raw.expectedInstanceIdentity;
+    clean.expectedInstanceIdentity = {
+      pid: Number.isInteger(Number(id.pid)) ? Number(id.pid) : undefined,
+      creationDate: typeof id.creationDate === 'string' ? id.creationDate : ''
+    };
+  }
+  return { ...clean, ...fixedOverrides };
 }
 
 function encodeGate3aBytesX64(spec) {
@@ -982,9 +1012,9 @@ async function withUnlockLock(targetPath, fn, options = {}) {
         const raw = fsImpl.readFileSync(ownerPath, 'utf8');
         staleOwner = JSON.parse(raw);
       } catch (readErr) {
-        cleanupDirSafeSync(prepDir, fsImpl);
         if (readErr && readErr.code === 'ENOENT') {
           if (!fsImpl.existsSync(lockDir)) {
+            cleanupDirSafeSync(prepDir, fsImpl);
             if (attempt < maxAcquireAttempts) {
               continue;
             }
@@ -994,9 +1024,10 @@ async function withUnlockLock(targetPath, fn, options = {}) {
               error: '锁状态发生变化，请重试'
             };
           }
-          // 再次重读确认是否刚刚被释放或确实损坏
+          // 再次重读 owner.json，区分“旧锁释放后新进程取得”、“刚刚释放消失”与“锁目录确实缺失/损坏”
           await sleepAsync(10);
           if (!fsImpl.existsSync(lockDir)) {
+            cleanupDirSafeSync(prepDir, fsImpl);
             if (attempt < maxAcquireAttempts) continue;
             return {
               ok: false,
@@ -1004,13 +1035,35 @@ async function withUnlockLock(targetPath, fn, options = {}) {
               error: '锁状态发生变化，请重试'
             };
           }
+          try {
+            const retryRaw = fsImpl.readFileSync(ownerPath, 'utf8');
+            staleOwner = JSON.parse(retryRaw);
+          } catch (retryErr) {
+            cleanupDirSafeSync(prepDir, fsImpl);
+            if (retryErr && retryErr.code === 'ENOENT' && !fsImpl.existsSync(lockDir)) {
+              if (attempt < maxAcquireAttempts) continue;
+              return {
+                ok: false,
+                code: 'LOCK_CONTENTION_RETRY_EXHAUSTED',
+                error: '锁状态发生变化，请重试'
+              };
+            }
+            return {
+              ok: false,
+              code: 'CORRUPTED_LOCK_FILE',
+              lockDir,
+              error: '锁目录元数据缺失或已损坏，已保留现场并中止操作'
+            };
+          }
+        } else {
+          cleanupDirSafeSync(prepDir, fsImpl);
+          return {
+            ok: false,
+            code: 'CORRUPTED_LOCK_FILE',
+            lockDir,
+            error: '锁目录元数据缺失或已损坏，已保留现场并中止操作'
+          };
         }
-        return {
-          ok: false,
-          code: 'CORRUPTED_LOCK_FILE',
-          lockDir,
-          error: '锁目录元数据缺失或已损坏，已保留现场并中止操作'
-        };
       }
 
       if (
@@ -1425,7 +1478,8 @@ async function resolveLiveInstanceBinary(origin, options = {}) {
     `$targetPid = [int]$pids[0]`,
     `$proc = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $targetPid)`,
     `if (-not $proc -or -not $proc.ExecutablePath) { [Console]::Out.Write((@{ ok = $false; reason = 'NO_EXEC_PATH'; pid = $targetPid } | ConvertTo-Json -Compress)); exit 0 }`,
-    `[Console]::Out.Write((@{ ok = $true; pid = $targetPid; name = [string]$proc.Name; executablePath = [string]$proc.ExecutablePath; creationDate = [string]$proc.CreationDate; parentPid = [int]$proc.ParentProcessId } | ConvertTo-Json -Compress))`
+    `$cDate = if ($proc.CreationDate -is [DateTime]) { $proc.CreationDate.ToUniversalTime().ToString('o') } else { [string]$proc.CreationDate }`,
+    `[Console]::Out.Write((@{ ok = $true; pid = $targetPid; name = [string]$proc.Name; executablePath = [string]$proc.ExecutablePath; creationDate = $cDate; parentPid = [int]$proc.ParentProcessId } | ConvertTo-Json -Compress))`
   ].join('; ');
 
   const rawJson = await new Promise(resolve => {
@@ -1486,13 +1540,17 @@ async function resolveLiveInstanceBinary(origin, options = {}) {
 
   const exePath = path.resolve(info.executablePath);
   const exeBase = path.basename(exePath).toLowerCase();
+  const canonicalBase = exeBase.replace(/\.old\.\d+$/i, '');
   let binDir = null;
 
-  if (exeBase === 'language_server.exe' || exeBase === 'language_server_windows_x64.exe') {
+  if (canonicalBase === 'language_server.exe' || canonicalBase === 'language_server_windows_x64.exe') {
+    const canonicalExePath = canonicalBase === exeBase
+      ? exePath
+      : path.join(path.dirname(exePath), path.basename(exePath).replace(/\.old\.\d+$/i, ''));
     return {
       ok: true,
-      binaryPath: exePath,
-      binDir: path.dirname(exePath),
+      binaryPath: canonicalExePath,
+      binDir: path.dirname(canonicalExePath),
       source: 'live_process',
       instanceIdentity: {
         pid: info.pid,
@@ -1527,6 +1585,52 @@ async function resolveLiveInstanceBinary(origin, options = {}) {
       port
     }
   };
+}
+
+function matchesLiveInstanceIdentity(actual, expected) {
+  if (!actual || !expected) return false;
+  const aPid = Number(actual.pid);
+  const ePid = Number(expected.pid);
+  if (!Number.isInteger(aPid) || aPid <= 0 || !Number.isInteger(ePid) || ePid <= 0) return false;
+  if (aPid !== ePid) return false;
+  if (String(actual.creationDate || '') !== String(expected.creationDate || '')) return false;
+  return true;
+}
+
+async function verifyLiveInstanceUnchanged(trustedLiveCheck, options = {}) {
+  if (!trustedLiveCheck) return { ok: true };
+  const targetPath = trustedLiveCheck.binaryPath;
+  if (!trustedLiveCheck.origin || !trustedLiveCheck.instanceIdentity) {
+    return {
+      ok: false,
+      code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+      targetPath,
+      error: 'Live 实例身份上下文缺失，已拒绝写入'
+    };
+  }
+  const recheck = await resolveLiveInstanceBinary(trustedLiveCheck.origin, options);
+  if (!recheck || !recheck.ok) {
+    return {
+      ok: false,
+      code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+      targetPath,
+      error: recheck?.error || '写入前复核运行实例失败：端口归属不可解析或进程已退出'
+    };
+  }
+  if (
+    !matchesLiveInstanceIdentity(recheck.instanceIdentity, trustedLiveCheck.instanceIdentity) ||
+    normalizeTargetPathKey(recheck.binaryPath) !== normalizeTargetPathKey(targetPath)
+  ) {
+    return {
+      ok: false,
+      code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+      targetPath,
+      expectedInstanceIdentity: trustedLiveCheck.instanceIdentity,
+      actualInstanceIdentity: recheck.instanceIdentity || null,
+      error: '检测到运行中的语言服务实例已重启或端口归属发生变化，已中止操作'
+    };
+  }
+  return { ok: true, instanceIdentity: recheck.instanceIdentity };
 }
 
 async function resolveTargetBinary(options = {}, resolveOpts = {}) {
@@ -1647,6 +1751,36 @@ async function resolveTargetBinary(options = {}, resolveOpts = {}) {
 // 记录当前宿主进程首次观测到的各 targetId 磁盘 SHA256 及本会话写入标记
 const initialObservedDiskSha = new Map();
 const modifiedInCurrentProcess = new Set();
+
+function mergeRetiredOldFiles(...lists) {
+  const byPath = new Map();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item || typeof item.oldPath !== 'string' || typeof item.sha256 !== 'string') continue;
+      const key = normalizeTargetPathKey(item.oldPath);
+      if (!byPath.has(key)) {
+        byPath.set(key, item);
+      }
+    }
+  }
+  return Array.from(byPath.values());
+}
+
+function hasMissingRetiredOldFiles(currentList, requiredList) {
+  if (!Array.isArray(requiredList) || requiredList.length === 0) return false;
+  const known = new Set(
+    (Array.isArray(currentList) ? currentList : [])
+      .filter(item => item && typeof item.oldPath === 'string')
+      .map(item => normalizeTargetPathKey(item.oldPath))
+  );
+  for (const req of requiredList) {
+    if (req && typeof req.oldPath === 'string' && !known.has(normalizeTargetPathKey(req.oldPath))) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function countRemainingRetiredOldFiles(manifest, fsImpl = fs) {
   if (!manifest || !Array.isArray(manifest.retiredOldFiles)) return 0;
@@ -1815,7 +1949,25 @@ async function getUnlockStatusInternal(options = {}) {
       ? 'pending_restart'
       : 'unknown';
 
-  const committedOldFiles = countRemainingRetiredOldFiles(manifest, fsImpl);
+  const terminalTx = txCheck.state === 'OK' && txCheck.tx && ['COMMITTED', 'RECOVERED'].includes(txCheck.tx.status)
+    ? txCheck.tx
+    : null;
+  const mergedRetiredOldFiles = mergeRetiredOldFiles(
+    manifest?.retiredOldFiles,
+    terminalTx?.pendingManifest?.retiredOldFiles
+  );
+  const committedOldFiles = countRemainingRetiredOldFiles({ retiredOldFiles: mergedRetiredOldFiles }, fsImpl);
+  const manifestSyncPending = Boolean(
+    terminalTx &&
+    terminalTx.status === 'COMMITTED' &&
+    terminalTx.pendingManifest &&
+    currentSha256 === terminalTx.afterSha256 &&
+    (
+      !manifest ||
+      manifest.patchedSha256 !== terminalTx.afterSha256 ||
+      hasMissingRetiredOldFiles(manifest.retiredOldFiles, terminalTx.pendingManifest.retiredOldFiles)
+    )
+  );
 
   return {
     ok: true,
@@ -1853,6 +2005,7 @@ async function getUnlockStatusInternal(options = {}) {
     cleanupState: {
       committedOldFiles
     },
+    manifestSyncPending,
     activeTransaction: activeTx,
     needsRecovery: Boolean(activeTx),
     canWrite,
@@ -1976,23 +2129,37 @@ async function dryRunUnlockInternal(options = {}) {
  */
 async function applyUnlockInternal(options = {}) {
   const fsImpl = options.fs || fs;
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: true });
+  const resolved = options._preResolvedTarget || await resolveTargetBinary(options, { allowMissingTarget: true });
   if (!resolved.ok) return resolved;
 
   const targetPath = resolved.binaryPath;
   const bakPath = `${targetPath}.bak`;
   const { targetId, txPath, manifestPath, backupsDir } = getTargetArtifactPaths(targetPath, options);
 
-  // Live 模式写前复核实例身份未变
-  if (resolved.runtimeMode === 'live' && options.expectedInstanceIdentity) {
-    const curId = resolved.instanceIdentity;
-    const expId = options.expectedInstanceIdentity;
-    if (!curId || curId.pid !== expId.pid || curId.creationDate !== expId.creationDate) {
+  // Live 模式：建立可信实例身份上下文（启动前首轮校验 + 锁内替换前二次复核）
+  let trustedLiveCheck = options._trustedLiveCheck || null;
+  if (resolved.runtimeMode === 'live') {
+    if (!resolved.instanceIdentity) {
+      return {
+        ok: false,
+        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+        targetPath,
+        error: '未能获取可信的运行实例身份，已拒绝写入'
+      };
+    }
+    if (options.expectedInstanceIdentity && !matchesLiveInstanceIdentity(resolved.instanceIdentity, options.expectedInstanceIdentity)) {
       return {
         ok: false,
         code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
         targetPath,
         error: '检测到运行中的语言服务实例已重启或发生变化，请重新预检后再应用'
+      };
+    }
+    if (!trustedLiveCheck) {
+      trustedLiveCheck = {
+        origin: options.origin,
+        binaryPath: targetPath,
+        instanceIdentity: resolved.instanceIdentity
       };
     }
   }
@@ -2059,9 +2226,21 @@ async function applyUnlockInternal(options = {}) {
       };
     }
 
+    // 2.5 Live 模式在 Worker 持锁且发生任何磁盘改动前，再次复核端口归属与 (pid, creationDate)
+    if (trustedLiveCheck) {
+      const liveRecheck = await verifyLiveInstanceUnchanged(trustedLiveCheck, {
+        ...options,
+        allowMissingTarget: false,
+        fs: fsImpl
+      });
+      if (!liveRecheck.ok) {
+        return liveRecheck;
+      }
+    }
+
     // 3. 锁内原子建立或验证同构建 .bak
     let bakBuf = null;
-    if (staticInspect.isUnpatchedOriginal) {
+    if (staticInspect.isUnpatchedOriginal && !options._requireExistingBackup) {
       let needWriteBak = !fsImpl.existsSync(bakPath);
       if (!needWriteBak) {
         const existingBakBuf = fsImpl.readFileSync(bakPath);
@@ -2140,6 +2319,43 @@ async function applyUnlockInternal(options = {}) {
 
     const verifiedBakSha256 = sha256Buffer(bakBuf);
 
+    // 3.5 在覆盖终态事务日志或提前返回前，可靠合并现有 manifest 与历史终态事务中的 retiredOldFiles，并尽力补齐未同步的 manifest
+    let existingManifest = null;
+    let manifestRetiredOldFiles = [];
+    if (fsImpl.existsSync(manifestPath)) {
+      try {
+        existingManifest = JSON.parse(fsImpl.readFileSync(manifestPath, 'utf8'));
+        if (Array.isArray(existingManifest?.retiredOldFiles)) {
+          manifestRetiredOldFiles = existingManifest.retiredOldFiles;
+        }
+      } catch {}
+    }
+    const prevTx = (txCheck.state === 'OK' && txCheck.tx) ? txCheck.tx : null;
+    const txRetiredOldFiles = Array.isArray(prevTx?.pendingManifest?.retiredOldFiles)
+      ? prevTx.pendingManifest.retiredOldFiles
+      : [];
+    const prevRetiredOldFiles = mergeRetiredOldFiles(manifestRetiredOldFiles, txRetiredOldFiles);
+
+    if (prevTx && prevTx.status === 'COMMITTED' && prevTx.pendingManifest) {
+      const needPreSyncManifest =
+        !existingManifest ||
+        (beforeSha256 === prevTx.afterSha256 && existingManifest.patchedSha256 !== prevTx.afterSha256) ||
+        hasMissingRetiredOldFiles(existingManifest.retiredOldFiles, prevRetiredOldFiles);
+      if (needPreSyncManifest) {
+        const preSyncBase = beforeSha256 === prevTx.afterSha256
+          ? prevTx.pendingManifest
+          : (existingManifest || prevTx.pendingManifest);
+        try {
+          writeJsonAtomicSync(manifestPath, {
+            ...preSyncBase,
+            retiredOldFiles: prevRetiredOldFiles
+          }, fsImpl);
+        } catch {
+          // 若此刻 manifest 仍暂时不可写，prevRetiredOldFiles 已合并进入内存，将继续写入新事务 pendingManifest
+        }
+      }
+    }
+
     // 4. 基于已验证的 bakBuf 生成目标完整镜像
     const built = buildTargetImageFromOriginalBase(bakBuf, spec, currentBuf);
     if (!built.changed) {
@@ -2162,17 +2378,6 @@ async function applyUnlockInternal(options = {}) {
     const txId = `tx-${now}-${crypto.randomBytes(4).toString('hex')}`;
     const stagedPath = `${targetPath}.staged.${process.pid}.${now}.exe`;
     const oldPath = `${targetPath}.old.${now}`;
-
-    // 读取已有 manifest 中的 retiredOldFiles
-    let prevRetiredOldFiles = [];
-    if (fsImpl.existsSync(manifestPath)) {
-      try {
-        const prevM = JSON.parse(fsImpl.readFileSync(manifestPath, 'utf8'));
-        if (Array.isArray(prevM?.retiredOldFiles)) {
-          prevRetiredOldFiles = prevM.retiredOldFiles;
-        }
-      } catch {}
-    }
 
     // 阶段 0：写出 stagedPath 并 fsync + 读回校验
     let sfd = null;
@@ -2235,6 +2440,99 @@ async function applyUnlockInternal(options = {}) {
       await options._onAfterTxPrepared({ txRecord, txPath });
     }
 
+    const finalizePostCommit = async (method, manifestBeforeClean) => {
+      modifiedInCurrentProcess.add(targetId);
+      const cleanRes = cleanupRetiredOldFilesInLock(manifestBeforeClean, fsImpl);
+      const finalManifest = { ...manifestBeforeClean, retiredOldFiles: cleanRes.remaining };
+      const extraFields = method === 'hot_rename' ? { oldPath } : {};
+
+      try {
+        writeJsonAtomicSync(txPath, {
+          ...txRecord,
+          status: 'COMMITTED',
+          method,
+          oldPath: method === 'hot_rename' ? oldPath : null,
+          committedAt: Date.now(),
+          pendingManifest: finalManifest
+        }, fsImpl);
+      } catch (txCommitErr) {
+        return {
+          ok: false,
+          partialSuccess: true,
+          changed: true,
+          committed: true,
+          manifestSynced: false,
+          code: 'POST_COMMIT_TX_LOG_SYNC_FAILED',
+          error: `二进制补丁已落盘替换，但写入已提交事务记录失败 (${txCommitErr.code || txCommitErr.message})`,
+          txSyncError: {
+            code: txCommitErr.code || 'TX_LOG_WRITE_FAILED',
+            txPath,
+            error: txCommitErr.message
+          },
+          method,
+          ...extraFields,
+          targetPath,
+          bakPath,
+          targetId,
+          beforeSha256,
+          afterSha256,
+          appliedSpec: built.spec,
+          runtimeState: 'pending_restart',
+          cleanupState: { committedOldFiles: cleanRes.remaining.length }
+        };
+      }
+
+      if (typeof options._onBeforeManifestWriteAfterCommit === 'function') {
+        await options._onBeforeManifestWriteAfterCommit({ txPath, manifestPath });
+      }
+
+      try {
+        writeJsonAtomicSync(manifestPath, finalManifest, fsImpl);
+      } catch (manifestErr) {
+        return {
+          ok: false,
+          partialSuccess: true,
+          changed: true,
+          committed: true,
+          manifestSynced: false,
+          code: 'POST_COMMIT_MANIFEST_SYNC_FAILED',
+          error: `二进制补丁已提交落盘，但同步状态清单失败 (${manifestErr.code || manifestErr.message})；下次写入或执行恢复时将自动补齐`,
+          manifestSyncError: {
+            code: manifestErr.code || 'MANIFEST_WRITE_FAILED',
+            manifestPath,
+            error: manifestErr.message
+          },
+          method,
+          ...extraFields,
+          targetPath,
+          bakPath,
+          targetId,
+          beforeSha256,
+          afterSha256,
+          appliedSpec: built.spec,
+          runtimeState: 'pending_restart',
+          cleanupState: { committedOldFiles: cleanRes.remaining.length }
+        };
+      }
+
+      return {
+        ok: true,
+        changed: true,
+        committed: true,
+        manifestSynced: true,
+        method,
+        ...extraFields,
+        targetPath,
+        bakPath,
+        targetId,
+        beforeSha256,
+        afterSha256,
+        appliedSpec: built.spec,
+        runtimeState: 'pending_restart',
+        cleanupState: { committedOldFiles: cleanRes.remaining.length }
+      };
+    };
+
     // 阶段 1：尝试直接替换 (direct_replace)
     if (!options._forceHotRename) {
       let directReplaced = false;
@@ -2263,35 +2561,7 @@ async function applyUnlockInternal(options = {}) {
             error: '直接替换后目标文件哈希复核不匹配'
           };
         }
-        const cleanRes = cleanupRetiredOldFilesInLock(baseManifest, fsImpl);
-        const finalManifest = { ...baseManifest, retiredOldFiles: cleanRes.remaining };
-        writeJsonAtomicSync(txPath, {
-          ...txRecord,
-          status: 'COMMITTED',
-          method: 'direct_replace',
-          oldPath: null,
-          committedAt: Date.now(),
-          pendingManifest: finalManifest
-        }, fsImpl);
-        if (typeof options._onBeforeManifestWriteAfterCommit === 'function') {
-          await options._onBeforeManifestWriteAfterCommit({ txPath, manifestPath });
-        }
-        writeJsonAtomicSync(manifestPath, finalManifest, fsImpl);
-        modifiedInCurrentProcess.add(targetId);
-        return {
-          ok: true,
-          changed: true,
-          committed: true,
-          method: 'direct_replace',
-          targetPath,
-          bakPath,
-          targetId,
-          beforeSha256,
-          afterSha256,
-          appliedSpec: built.spec,
-          runtimeState: 'pending_restart',
-          cleanupState: { committedOldFiles: cleanRes.remaining.length }
-        };
+        return await finalizePostCommit('direct_replace', baseManifest);
       }
     }
 
@@ -2313,10 +2583,9 @@ async function applyUnlockInternal(options = {}) {
 
     const manifestWithOld = {
       ...baseManifest,
-      retiredOldFiles: [
-        ...prevRetiredOldFiles,
+      retiredOldFiles: mergeRetiredOldFiles(prevRetiredOldFiles, [
         { oldPath, sha256: beforeSha256, txId, committedAt: Date.now() }
-      ]
+      ])
     };
 
     writeJsonAtomicSync(txPath, {
@@ -2380,39 +2649,7 @@ async function applyUnlockInternal(options = {}) {
       };
     }
 
-    const cleanRes = cleanupRetiredOldFilesInLock(manifestWithOld, fsImpl);
-    const finalManifest = { ...manifestWithOld, retiredOldFiles: cleanRes.remaining };
-
-    writeJsonAtomicSync(txPath, {
-      ...txRecord,
-      status: 'COMMITTED',
-      method: 'hot_rename',
-      committedAt: Date.now(),
-      pendingManifest: finalManifest
-    }, fsImpl);
-
-    if (typeof options._onBeforeManifestWriteAfterCommit === 'function') {
-      await options._onBeforeManifestWriteAfterCommit({ txPath, manifestPath });
-    }
-
-    writeJsonAtomicSync(manifestPath, finalManifest, fsImpl);
-    modifiedInCurrentProcess.add(targetId);
-
-    return {
-      ok: true,
-      changed: true,
-      committed: true,
-      method: 'hot_rename',
-      oldPath,
-      targetPath,
-      bakPath,
-      targetId,
-      beforeSha256,
-      afterSha256,
-      appliedSpec: built.spec,
-      runtimeState: 'pending_restart',
-      cleanupState: { committedOldFiles: cleanRes.remaining.length }
-    };
+    return await finalizePostCommit('hot_rename', manifestWithOld);
   }, options);
 }
 
@@ -2421,8 +2658,36 @@ async function applyUnlockInternal(options = {}) {
  */
 async function restoreUnlockInternal(options = {}) {
   const fsImpl = options.fs || fs;
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: true });
+  const resolved = options._preResolvedTarget || await resolveTargetBinary(options, { allowMissingTarget: true });
   if (!resolved.ok) return resolved;
+
+  let trustedLiveCheck = options._trustedLiveCheck || null;
+  if (resolved.runtimeMode === 'live') {
+    if (!resolved.instanceIdentity) {
+      return {
+        ok: false,
+        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+        targetPath: resolved.binaryPath,
+        error: '未能获取可信的运行实例身份，已拒绝还原'
+      };
+    }
+    if (options.expectedInstanceIdentity && !matchesLiveInstanceIdentity(resolved.instanceIdentity, options.expectedInstanceIdentity)) {
+      return {
+        ok: false,
+        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+        targetPath: resolved.binaryPath,
+        error: '检测到运行中的语言服务实例已重启或发生变化，请重新预检后再还原'
+      };
+    }
+    if (!trustedLiveCheck) {
+      trustedLiveCheck = {
+        origin: options.origin,
+        binaryPath: resolved.binaryPath,
+        instanceIdentity: resolved.instanceIdentity
+      };
+    }
+  }
+
   const { txPath } = getTargetArtifactPaths(resolved.binaryPath, options);
   const txCheck = readTxLogStrict(txPath, fsImpl);
   if (txCheck.state === 'CORRUPTED') {
@@ -2441,7 +2706,13 @@ async function restoreUnlockInternal(options = {}) {
       error: '未找到同目录 .bak 原版备份文件，无法执行完整原版还原'
     };
   }
-  return await applyUnlockInternal({ ...options, mode: '256k', _requireExistingBackup: true });
+  return await applyUnlockInternal({
+    ...options,
+    mode: '256k',
+    _requireExistingBackup: true,
+    _preResolvedTarget: resolved,
+    _trustedLiveCheck: trustedLiveCheck
+  });
 }
 
 /**
@@ -2449,12 +2720,39 @@ async function restoreUnlockInternal(options = {}) {
  */
 async function recoverUnlockTransactionInternal(options = {}) {
   const fsImpl = options.fs || fs;
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: true });
+  const resolved = options._preResolvedTarget || await resolveTargetBinary(options, { allowMissingTarget: true });
   if (!resolved.ok) return resolved;
 
   const targetPath = resolved.binaryPath;
   const bakPath = `${targetPath}.bak`;
   const { targetId, txPath, manifestPath } = getTargetArtifactPaths(targetPath, options);
+
+  let trustedLiveCheck = options._trustedLiveCheck || null;
+  if (resolved.runtimeMode === 'live') {
+    if (!resolved.instanceIdentity) {
+      return {
+        ok: false,
+        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+        targetPath,
+        error: '未能获取可信的运行实例身份，已拒绝执行恢复'
+      };
+    }
+    if (options.expectedInstanceIdentity && !matchesLiveInstanceIdentity(resolved.instanceIdentity, options.expectedInstanceIdentity)) {
+      return {
+        ok: false,
+        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+        targetPath,
+        error: '检测到运行中的语言服务实例已重启或发生变化，请刷新状态后再执行恢复'
+      };
+    }
+    if (!trustedLiveCheck) {
+      trustedLiveCheck = {
+        origin: options.origin,
+        binaryPath: targetPath,
+        instanceIdentity: resolved.instanceIdentity
+      };
+    }
+  }
 
   return await withUnlockLock(targetPath, async () => {
     const txCheck = readTxLogStrict(txPath, fsImpl);
@@ -2466,6 +2764,17 @@ async function recoverUnlockTransactionInternal(options = {}) {
         txPath,
         error: '事务日志已损坏，请检查同目录 .old 或 .bak 文件手动恢复（已保留全部现场文件）'
       };
+    }
+
+    if (trustedLiveCheck) {
+      const liveRecheck = await verifyLiveInstanceUnchanged(trustedLiveCheck, {
+        ...options,
+        allowMissingTarget: true,
+        fs: fsImpl
+      });
+      if (!liveRecheck.ok) {
+        return liveRecheck;
+      }
     }
 
     const tx = txCheck.tx;
@@ -2481,21 +2790,49 @@ async function recoverUnlockTransactionInternal(options = {}) {
           error: '目标二进制文件不存在，且无进行中的未完成替换事务'
         };
       }
-      // 2.3 若事务为 COMMITTED 但写 manifest 前崩溃，幂等补齐 manifest
+      // 2.3 若事务为 COMMITTED 但写 manifest 前崩溃或失败，幂等补齐 manifest
       if (tx && tx.status === 'COMMITTED' && tx.pendingManifest) {
         const currentSha = sha256FileSync(targetPath, fsImpl);
         if (currentSha === tx.afterSha256) {
+          let curM = null;
           let needSyncManifest = !fsImpl.existsSync(manifestPath);
           if (!needSyncManifest) {
             try {
-              const curM = JSON.parse(fsImpl.readFileSync(manifestPath, 'utf8'));
-              if (curM.patchedSha256 !== tx.afterSha256) needSyncManifest = true;
+              curM = JSON.parse(fsImpl.readFileSync(manifestPath, 'utf8'));
+              if (
+                curM.patchedSha256 !== tx.afterSha256 ||
+                hasMissingRetiredOldFiles(curM.retiredOldFiles, tx.pendingManifest.retiredOldFiles)
+              ) {
+                needSyncManifest = true;
+              }
             } catch {
               needSyncManifest = true;
             }
           }
           if (needSyncManifest) {
-            writeJsonAtomicSync(manifestPath, tx.pendingManifest, fsImpl);
+            const mergedManifest = {
+              ...tx.pendingManifest,
+              retiredOldFiles: mergeRetiredOldFiles(curM?.retiredOldFiles, tx.pendingManifest.retiredOldFiles)
+            };
+            try {
+              writeJsonAtomicSync(manifestPath, mergedManifest, fsImpl);
+            } catch (manifestErr) {
+              return {
+                ok: false,
+                partialSuccess: true,
+                committed: true,
+                manifestSynced: false,
+                code: 'POST_COMMIT_MANIFEST_SYNC_FAILED',
+                manifestSyncError: {
+                  code: manifestErr.code || 'MANIFEST_WRITE_FAILED',
+                  manifestPath,
+                  error: manifestErr.message
+                },
+                targetPath,
+                targetId,
+                error: `补同步状态清单失败: ${manifestErr.message}`
+              };
+            }
             return {
               ok: true,
               noop: true,
@@ -2513,6 +2850,49 @@ async function recoverUnlockTransactionInternal(options = {}) {
         targetId
       };
     }
+
+    const finalizeRecoveredTxLog = (recoveredFrom, restoredSha256, markModified) => {
+      if (markModified) {
+        modifiedInCurrentProcess.add(targetId);
+      }
+      try {
+        writeJsonAtomicSync(txPath, {
+          ...tx,
+          status: 'RECOVERED',
+          recoveredFrom,
+          recoveredAt: Date.now()
+        }, fsImpl);
+      } catch (txErr) {
+        return {
+          ok: false,
+          partialSuccess: true,
+          recovered: true,
+          recoveredFrom,
+          committed: true,
+          txSynced: false,
+          code: 'POST_RECOVERY_TX_LOG_SYNC_FAILED',
+          txSyncError: {
+            code: txErr.code || 'TX_LOG_WRITE_FAILED',
+            txPath,
+            error: txErr.message
+          },
+          targetPath,
+          targetId,
+          restoredSha256,
+          error: `文件已恢复，事务记录待同步 (${txErr.code || txErr.message})`
+        };
+      }
+      return {
+        ok: true,
+        recovered: true,
+        recoveredFrom,
+        committed: true,
+        txSynced: true,
+        targetPath,
+        targetId,
+        restoredSha256
+      };
+    };
 
     // 存在未完成事务 (PREPARED / MOVING_OLD / OLD_MOVED / ROLLBACK_FAILED)
     if (!fsImpl.existsSync(targetPath)) {
@@ -2540,22 +2920,7 @@ async function recoverUnlockTransactionInternal(options = {}) {
         if (tx.stagedPath && fsImpl.existsSync(tx.stagedPath)) {
           try { fsImpl.unlinkSync(tx.stagedPath); } catch {}
         }
-        writeJsonAtomicSync(txPath, {
-          ...tx,
-          status: 'RECOVERED',
-          recoveredFrom: 'oldPath',
-          recoveredAt: Date.now()
-        }, fsImpl);
-        modifiedInCurrentProcess.add(targetId);
-        return {
-          ok: true,
-          recovered: true,
-          recoveredFrom: 'oldPath',
-          committed: true,
-          targetPath,
-          targetId,
-          restoredSha256: tx.beforeSha256
-        };
+        return finalizeRecoveredTxLog('oldPath', tx.beforeSha256, true);
       }
 
       // 2.1 确定性从 .bak 恢复（仅当 sha256(bakPath) === tx.beforeSha256 时才允许作为普通事务回滚）
@@ -2594,22 +2959,7 @@ async function recoverUnlockTransactionInternal(options = {}) {
           if (tx.stagedPath && fsImpl.existsSync(tx.stagedPath)) {
             try { fsImpl.unlinkSync(tx.stagedPath); } catch {}
           }
-          writeJsonAtomicSync(txPath, {
-            ...tx,
-            status: 'RECOVERED',
-            recoveredFrom: 'bakPath',
-            recoveredAt: Date.now()
-          }, fsImpl);
-          modifiedInCurrentProcess.add(targetId);
-          return {
-            ok: true,
-            recovered: true,
-            recoveredFrom: 'bakPath',
-            committed: true,
-            targetPath,
-            targetId,
-            restoredSha256: tx.beforeSha256
-          };
+          return finalizeRecoveredTxLog('bakPath', tx.beforeSha256, true);
         }
 
         return {
@@ -2636,41 +2986,80 @@ async function recoverUnlockTransactionInternal(options = {}) {
       if (tx.stagedPath && fsImpl.existsSync(tx.stagedPath)) {
         try { fsImpl.unlinkSync(tx.stagedPath); } catch {}
       }
-      writeJsonAtomicSync(txPath, {
-        ...tx,
-        status: 'RECOVERED',
-        recoveredFrom: 'target_intact_before',
-        recoveredAt: Date.now()
-      }, fsImpl);
-      return {
-        ok: true,
-        recovered: true,
-        recoveredFrom: 'target_intact_before',
-        committed: true,
-        targetPath,
-        targetId,
-        restoredSha256: currentSha
-      };
+      return finalizeRecoveredTxLog('target_intact_before', currentSha, false);
     }
 
     if (currentSha === tx.afterSha256) {
       if (tx.stagedPath && fsImpl.existsSync(tx.stagedPath)) {
         try { fsImpl.unlinkSync(tx.stagedPath); } catch {}
       }
-      writeJsonAtomicSync(txPath, {
-        ...tx,
-        status: 'COMMITTED',
-        committedAt: Date.now()
-      }, fsImpl);
-      if (tx.pendingManifest) {
-        writeJsonAtomicSync(manifestPath, tx.pendingManifest, fsImpl);
-      }
       modifiedInCurrentProcess.add(targetId);
+      try {
+        writeJsonAtomicSync(txPath, {
+          ...tx,
+          status: 'COMMITTED',
+          committedAt: Date.now()
+        }, fsImpl);
+      } catch (txErr) {
+        return {
+          ok: false,
+          partialSuccess: true,
+          recovered: true,
+          recoveredFrom: 'target_reached_after',
+          committed: true,
+          txSynced: false,
+          manifestSynced: false,
+          code: 'POST_RECOVERY_TX_LOG_SYNC_FAILED',
+          txSyncError: {
+            code: txErr.code || 'TX_LOG_WRITE_FAILED',
+            txPath,
+            error: txErr.message
+          },
+          targetPath,
+          targetId,
+          restoredSha256: currentSha,
+          error: `文件已恢复，事务记录待同步 (${txErr.code || txErr.message})`
+        };
+      }
+      if (tx.pendingManifest) {
+        let curM = null;
+        if (fsImpl.existsSync(manifestPath)) {
+          try { curM = JSON.parse(fsImpl.readFileSync(manifestPath, 'utf8')); } catch {}
+        }
+        const mergedManifest = {
+          ...tx.pendingManifest,
+          retiredOldFiles: mergeRetiredOldFiles(curM?.retiredOldFiles, tx.pendingManifest.retiredOldFiles)
+        };
+        try {
+          writeJsonAtomicSync(manifestPath, mergedManifest, fsImpl);
+        } catch (manifestErr) {
+          return {
+            ok: false,
+            partialSuccess: true,
+            recovered: true,
+            recoveredFrom: 'target_reached_after',
+            committed: true,
+            txSynced: true,
+            manifestSynced: false,
+            code: 'POST_COMMIT_MANIFEST_SYNC_FAILED',
+            manifestSyncError: {
+              code: manifestErr.code || 'MANIFEST_WRITE_FAILED',
+              manifestPath,
+              error: manifestErr.message
+            },
+            targetPath,
+            targetId,
+            restoredSha256: currentSha,
+            error: `目标二进制已恢复提交，但同步状态清单失败: ${manifestErr.message}`
+          };
+        }
+      }
       return {
         ok: true,
         recovered: true,
         recoveredFrom: 'target_reached_after',
         committed: true,
+        txSynced: true,
         manifestSynced: Boolean(tx.pendingManifest),
         targetPath,
         targetId,
@@ -2806,7 +3195,20 @@ async function getUnlockStatus(options = {}) {
 
   if (!targetExists || hasActiveOrCorruptTx) {
     statusCache.delete(cacheKey);
-    return await getUnlockStatusInternal(options);
+    if (shouldUseDirectInProcess(options) || !targetExists || txCheck.state === 'CORRUPTED') {
+      return await getUnlockStatusInternal(options);
+    }
+    const res = await runInUnlockWorkerSubprocess('status', {
+      ...options,
+      runtimeMode: 'cli',
+      binaryPath: targetPath
+    });
+    return {
+      ...res,
+      runtimeMode: resolved.runtimeMode,
+      source: resolved.source,
+      instanceIdentity: resolved.instanceIdentity || null
+    };
   }
 
   const metaSig = [
@@ -2882,7 +3284,7 @@ async function dryRunUnlock(options = {}) {
   if (shouldUseDirectInProcess(options)) {
     return await dryRunUnlockInternal(options);
   }
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: false });
+  const resolved = await resolveTargetBinary(options, { allowMissingTarget: true });
   if (!resolved.ok) return resolved;
   const res = await runInUnlockWorkerSubprocess('dryRun', {
     ...options,
@@ -2897,36 +3299,83 @@ async function dryRunUnlock(options = {}) {
   };
 }
 
+async function prepareWorkerWriteDispatch(options = {}, actionLabel = '执行操作') {
+  const resolved = await resolveTargetBinary(options, { allowMissingTarget: true });
+  if (!resolved.ok) return { ok: false, earlyReturn: resolved };
+
+  if (resolved.runtimeMode === 'live') {
+    if (!resolved.instanceIdentity) {
+      return {
+        ok: false,
+        earlyReturn: {
+          ok: false,
+          code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+          targetPath: resolved.binaryPath,
+          error: `未能获取可信的运行实例身份，已拒绝${actionLabel}`
+        }
+      };
+    }
+    if (options.expectedInstanceIdentity && !matchesLiveInstanceIdentity(resolved.instanceIdentity, options.expectedInstanceIdentity)) {
+      return {
+        ok: false,
+        earlyReturn: {
+          ok: false,
+          code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
+          targetPath: resolved.binaryPath,
+          error: `检测到运行中的语言服务实例已重启或发生变化，请重新预检后再${actionLabel}`
+        }
+      };
+    }
+  }
+
+  const isLive = resolved.runtimeMode === 'live';
+  const workerPayload = {
+    ...options,
+    runtimeMode: isLive ? 'live' : 'cli',
+    origin: isLive ? options.origin : undefined,
+    binaryPath: resolved.binaryPath,
+    _preResolvedTarget: {
+      ok: true,
+      binaryPath: resolved.binaryPath,
+      binDir: resolved.binDir,
+      runtimeMode: resolved.runtimeMode,
+      source: resolved.source,
+      instanceIdentity: resolved.instanceIdentity || null
+    },
+    _trustedLiveCheck: isLive
+      ? {
+          origin: options.origin,
+          binaryPath: resolved.binaryPath,
+          instanceIdentity: resolved.instanceIdentity
+        }
+      : null
+  };
+
+  return { ok: true, resolved, workerPayload };
+}
+
 async function applyUnlock(options = {}) {
   invalidateUnlockStatusCache();
   if (shouldUseDirectInProcess(options)) {
     return await applyUnlockInternal(options);
   }
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: false });
-  if (!resolved.ok) return resolved;
-  if (resolved.runtimeMode === 'live' && options.expectedInstanceIdentity) {
-    const curId = resolved.instanceIdentity;
-    const expId = options.expectedInstanceIdentity;
-    if (!curId || curId.pid !== expId.pid || curId.creationDate !== expId.creationDate) {
-      return {
-        ok: false,
-        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
-        targetPath: resolved.binaryPath,
-        error: '检测到运行中的语言服务实例已重启或发生变化，请重新预检后再应用'
-      };
-    }
-  }
+  const prep = await prepareWorkerWriteDispatch(options, '应用');
+  if (!prep.ok) return prep.earlyReturn;
+  const { resolved, workerPayload } = prep;
   const targetId = computeTargetId(resolved.binaryPath);
-  const res = await runInUnlockWorkerSubprocess('apply', {
-    ...options,
-    runtimeMode: 'cli',
-    binaryPath: resolved.binaryPath
-  });
+  const res = await runInUnlockWorkerSubprocess('apply', workerPayload);
   if (res && (res.ok || res.committed)) {
     modifiedInCurrentProcess.add(targetId);
     invalidateUnlockStatusCache(resolved.binaryPath);
   }
-  return res;
+  return res && typeof res === 'object'
+    ? {
+        ...res,
+        runtimeMode: resolved.runtimeMode,
+        source: resolved.source,
+        instanceIdentity: res.instanceIdentity || resolved.instanceIdentity || null
+      }
+    : res;
 }
 
 async function restoreUnlock(options = {}) {
@@ -2934,31 +3383,23 @@ async function restoreUnlock(options = {}) {
   if (shouldUseDirectInProcess(options)) {
     return await restoreUnlockInternal(options);
   }
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: false });
-  if (!resolved.ok) return resolved;
-  if (resolved.runtimeMode === 'live' && options.expectedInstanceIdentity) {
-    const curId = resolved.instanceIdentity;
-    const expId = options.expectedInstanceIdentity;
-    if (!curId || curId.pid !== expId.pid || curId.creationDate !== expId.creationDate) {
-      return {
-        ok: false,
-        code: 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED',
-        targetPath: resolved.binaryPath,
-        error: '检测到运行中的语言服务实例已重启或发生变化，请重新预检后再还原'
-      };
-    }
-  }
+  const prep = await prepareWorkerWriteDispatch(options, '还原');
+  if (!prep.ok) return prep.earlyReturn;
+  const { resolved, workerPayload } = prep;
   const targetId = computeTargetId(resolved.binaryPath);
-  const res = await runInUnlockWorkerSubprocess('restore', {
-    ...options,
-    runtimeMode: 'cli',
-    binaryPath: resolved.binaryPath
-  });
+  const res = await runInUnlockWorkerSubprocess('restore', workerPayload);
   if (res && (res.ok || res.committed)) {
     modifiedInCurrentProcess.add(targetId);
     invalidateUnlockStatusCache(resolved.binaryPath);
   }
-  return res;
+  return res && typeof res === 'object'
+    ? {
+        ...res,
+        runtimeMode: resolved.runtimeMode,
+        source: resolved.source,
+        instanceIdentity: res.instanceIdentity || resolved.instanceIdentity || null
+      }
+    : res;
 }
 
 async function recoverUnlockTransaction(options = {}) {
@@ -2966,19 +3407,23 @@ async function recoverUnlockTransaction(options = {}) {
   if (shouldUseDirectInProcess(options)) {
     return await recoverUnlockTransactionInternal(options);
   }
-  const resolved = await resolveTargetBinary(options, { allowMissingTarget: true });
-  if (!resolved.ok) return resolved;
+  const prep = await prepareWorkerWriteDispatch(options, '执行恢复');
+  if (!prep.ok) return prep.earlyReturn;
+  const { resolved, workerPayload } = prep;
   const targetId = computeTargetId(resolved.binaryPath);
-  const res = await runInUnlockWorkerSubprocess('recover', {
-    ...options,
-    runtimeMode: 'cli',
-    binaryPath: resolved.binaryPath
-  });
+  const res = await runInUnlockWorkerSubprocess('recover', workerPayload);
   if (res && (res.ok || res.committed)) {
     modifiedInCurrentProcess.add(targetId);
     invalidateUnlockStatusCache(resolved.binaryPath);
   }
-  return res;
+  return res && typeof res === 'object'
+    ? {
+        ...res,
+        runtimeMode: resolved.runtimeMode,
+        source: resolved.source,
+        instanceIdentity: res.instanceIdentity || resolved.instanceIdentity || null
+      }
+    : res;
 }
 
 // Worker 子进程入口
@@ -3023,6 +3468,7 @@ module.exports = {
   resolveUnlockStateDir,
   getTargetArtifactPaths,
   normalizeTargetSpec,
+  sanitizePublicUnlockOptions,
   encodeGate3aBytesX64,
   parsePeLayout,
   findTextSection,

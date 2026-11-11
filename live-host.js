@@ -19,7 +19,8 @@ const {
   dryRunUnlock,
   applyUnlock,
   restoreUnlock,
-  recoverUnlockTransaction
+  recoverUnlockTransaction,
+  sanitizePublicUnlockOptions
 } = require('./meter-unlock');
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1MB 传输体积上限
@@ -115,31 +116,31 @@ const ALLOWED_ROUTES = [
           return;
         }
         if (req.url === '/unlock-status') {
-          const result = await getUnlockStatus({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          const result = await getUnlockStatus(sanitizePublicUnlockOptions(request, { runtimeMode: 'live', origin: api.origin }));
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify(result));
           return;
         }
         if (req.url === '/unlock-dry-run') {
-          const result = await dryRunUnlock({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          const result = await dryRunUnlock(sanitizePublicUnlockOptions(request, { runtimeMode: 'live', origin: api.origin }));
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify(result));
           return;
         }
         if (req.url === '/unlock-apply') {
-          const result = await applyUnlock({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          const result = await applyUnlock(sanitizePublicUnlockOptions(request, { runtimeMode: 'live', origin: api.origin }));
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify(result));
           return;
         }
         if (req.url === '/unlock-restore') {
-          const result = await restoreUnlock({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          const result = await restoreUnlock(sanitizePublicUnlockOptions(request, { runtimeMode: 'live', origin: api.origin }));
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify(result));
           return;
         }
         if (req.url === '/unlock-recover') {
-          const result = await recoverUnlockTransaction({ ...request, runtimeMode: 'live', origin: api.origin, binaryPath: undefined });
+          const result = await recoverUnlockTransaction(sanitizePublicUnlockOptions(request, { runtimeMode: 'live', origin: api.origin }));
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify(result));
           return;

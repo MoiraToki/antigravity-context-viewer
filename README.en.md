@@ -30,15 +30,20 @@ This repository is a secondary development (fork) based on [elviscjn-cjn/antigra
 
 ## 🚀 Basic Usage
 
+> **Prerequisites**: `Node.js >= 22.4.0` (Python is optional for office/PDF attachment scanning; Local Compaction Cap Configuration supports Windows x64 desktop only).
+
 ```bash
-# Install plugin
+# Clone repository and install the context viewer plugin
+git clone https://github.com/MoiraToki/antigravity-context-viewer.git
+cd antigravity-context-viewer
 node cli.js install
 
-# Check or change local compaction cap via CLI (or use the in-app panel directly)
-node cli.js unlock status
-node cli.js unlock 512k
-node cli.js unlock restore
+# Local compaction cap configuration (can also be operated directly from the in-app panel)
+node cli.js unlock status           # Check current compaction cap status
+node cli.js unlock 512k --dry-run   # Dry-run pre-check for 512K tier (no files modified)
+node cli.js unlock 512k             # Apply 512K tier (or custom tier like 768k; restart client to take effect)
+node cli.js unlock restore          # Restore ONLY the local compaction cap to original default
 
-# Restore original client archive
+# Uninstall the context viewer plugin (restore original client archive)
 node cli.js restore
 ```

@@ -30,15 +30,20 @@
 
 ## 🚀 基本使用
 
+> **前置要求**：`Node.js >= 22.4.0`（可选安装 Python 以支持本地办公文档附件深度解析；「本地压缩上限配置」仅支持 Windows x64 桌面端）。
+
 ```bash
-# 安装插件
+# 克隆仓库并安装上下文看板插件
+git clone https://github.com/MoiraToki/antigravity-context-viewer.git
+cd antigravity-context-viewer
 node cli.js install
 
-# 查看或修改本地压缩上限（也可直接在客户端上下文面板内点击操作）
-node cli.js unlock status
-node cli.js unlock 512k
-node cli.js unlock restore
+# 本地压缩上限配置（也可直接在客户端上下文面板内点击操作）
+node cli.js unlock status           # 查看当前压缩上限状态
+node cli.js unlock 512k --dry-run   # 预检 512K 档位（不修改文件）
+node cli.js unlock 512k             # 应用 512K 档位（也可填 768k 等自定义档位，重启客户端生效）
+node cli.js unlock restore          # 仅还原「本地压缩上限」至原版默认
 
-# 还原插件
+# 卸载上下文看板插件（还原客户端原包）
 node cli.js restore
 ```

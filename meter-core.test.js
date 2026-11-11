@@ -1263,16 +1263,17 @@ test('semver & update filtering: strictly accepts v0.x tags, ignores asset filen
 });
 
 test('isValidExternalUrl: strictly allows only official repository paths and subpaths', () => {
-  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer'), true);
-  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/'), true);
-  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases'), true);
-  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/issues'), true);
-  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/tag/v0.8.0'), true);
+  assert.equal(isValidExternalUrl('https://github.com/MoiraToki/antigravity-context-viewer'), true);
+  assert.equal(isValidExternalUrl('https://github.com/MoiraToki/antigravity-context-viewer/'), true);
+  assert.equal(isValidExternalUrl('https://github.com/MoiraToki/antigravity-context-viewer/releases'), true);
+  assert.equal(isValidExternalUrl('https://github.com/MoiraToki/antigravity-context-viewer/issues'), true);
+  assert.equal(isValidExternalUrl('https://github.com/MoiraToki/antigravity-context-viewer/releases/tag/v0.8.0'), true);
 
-  // 拒绝非官方仓库与恶意跳转
+  // 拒绝非当前仓库与恶意跳转
+  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer'), false);
   assert.equal(isValidExternalUrl('https://github.com/other-user/antigravity-context-viewer'), false);
-  assert.equal(isValidExternalUrl('https://malicious.com/github.com/elviscjn-cjn/antigravity-context-viewer'), false);
-  assert.equal(isValidExternalUrl('http://github.com/elviscjn-cjn/antigravity-context-viewer'), false); // 非 https
+  assert.equal(isValidExternalUrl('https://malicious.com/github.com/MoiraToki/antigravity-context-viewer'), false);
+  assert.equal(isValidExternalUrl('http://github.com/MoiraToki/antigravity-context-viewer'), false); // 非 https
   assert.equal(isValidExternalUrl('javascript:alert(1)'), false);
   assert.equal(isValidExternalUrl(''), false);
   assert.equal(isValidExternalUrl(null), false);

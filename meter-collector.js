@@ -1506,7 +1506,7 @@ function collectTokenHistory(options = {}) {
 // 在线更新模块 (GitHub Releases 探测、SHA-256 校验与零依赖热安装)
 // ============================================================================
 
-const OFFICIAL_REPO = 'elviscjn-cjn/antigravity-context-viewer';
+const OFFICIAL_REPO = 'MoiraToki/antigravity-context-viewer';
 const OFFICIAL_RELEASES_API = `https://api.github.com/repos/${OFFICIAL_REPO}/releases`;
 
 let cachedUpdateCheck = null;

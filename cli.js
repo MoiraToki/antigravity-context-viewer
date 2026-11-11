@@ -79,7 +79,7 @@ async function queryLiveWindow() {
             return {
               active: Boolean(window.__AGContextMeter),
               version: window.__AGContextMeter?.version || null,
-              hasIpcBridge: Boolean(window.contextMeterAPI?.scan && window.contextMeterAPI?.saveSettings && window.contextMeterAPI?.launchCli),
+              hasIpcBridge: Boolean(window.contextMeterAPI?.scan && window.contextMeterAPI?.saveSettings && window.contextMeterAPI?.launchCli && window.contextMeterAPI?.getUnlockStatus),
               badgeText: root?.getElementById('amount')?.textContent || null,
               route: s?.route || null,
               latest: s?.latest || null
@@ -215,6 +215,14 @@ async function main() {
   } else if (cmd === 'restore' || cmd === 'uninstall') {
     const res = await restore();
     console.log(`✅ 已无损还原官方包: ${res.restored}`);
+    if (process.platform === 'win32') {
+      try {
+        const st = await getUnlockStatus({ runtimeMode: 'cli' });
+        if (st && st.ok && (st.status === 'patched' || st.status === 'mixed_patched' || st.needsRecovery)) {
+          console.log(`ℹ️ 提示：检测到本地压缩上限补丁仍处于已修改状态 (${st.diskState?.label || st.status})；如需一并还原后端二进制，请执行: node cli.js unlock ${st.needsRecovery ? 'recover' : 'restore'}`);
+        }
+      } catch {}
+    }
   } else if (cmd === 'status') {
     await cmdStatus(customPath);
   } else if (cmd === 'check') {

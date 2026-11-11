@@ -1342,7 +1342,7 @@ test('online update and GitHub entry points: openExternal whitelist enforcement 
         latestVersion: '0.8.1',
         tagName: 'v0.8.1',
         releaseNotes: '新特性说明',
-        htmlUrl: 'https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/tag/v0.8.1'
+        htmlUrl: 'https://github.com/MoiraToki/antigravity-context-viewer/releases/tag/v0.8.1'
       };
     },
     applyUpdate: opts => { appliedUpdateOpts = opts; return { ok: true, version: '0.8.1' }; }
@@ -1350,7 +1350,7 @@ test('online update and GitHub entry points: openExternal whitelist enforcement 
   const api = h.sandbox.__AGContextMeter;
 
   h.elements.get('btn-github-repo').click();
-  assert.equal(openedUrl, 'https://github.com/elviscjn-cjn/antigravity-context-viewer');
+  assert.equal(openedUrl, 'https://github.com/MoiraToki/antigravity-context-viewer');
 
   h.elements.get('btn-check-update').click();
   await h.flush();
@@ -1361,7 +1361,7 @@ test('online update and GitHub entry points: openExternal whitelist enforcement 
   assert.match(h.elements.get('up-pop-ver').textContent, /v0\.8\.1/);
 
   h.elements.get('btn-view-release-page').click();
-  assert.equal(openedUrl, 'https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/tag/v0.8.1');
+  assert.equal(openedUrl, 'https://github.com/MoiraToki/antigravity-context-viewer/releases/tag/v0.8.1');
 
   h.elements.get('btn-apply-update').click();
   await h.flush();
@@ -1370,213 +1370,336 @@ test('online update and GitHub entry points: openExternal whitelist enforcement 
   api.dispose();
 });
 
-test('unlock drawer UI controls, read-only & recovery states, and 100% zero coupling with d.budget and #key-limit', async () => {
+test('unlock drawer UI controls end-to-end with real meter-unlock module, read-only & recovery states, and 100% zero coupling with d.budget and #key-limit', async () => {
+  const os = require('node:os');
+  const path = require('node:path');
+  const crypto = require('node:crypto');
+  const unlock = require('./meter-unlock');
+
+  function buildRendererPeFixture() {
+    const data = Buffer.alloc(0x30000, 0);
+    data.write('MZ', 0, 'ascii');
+    data.writeUInt32LE(0x80, 0x3C);
+    data.write('PE\0\0', 0x80, 'ascii');
+    data.writeUInt16LE(0x8664, 0x84);
+    data.writeUInt16LE(2, 0x86);
+    data.writeUInt16LE(0xF0, 0x94);
+    data.writeUInt16LE(0x20B, 0x98);
+    data.writeBigUInt64LE(0x140000000n, 0xB0);
+    const sections = [
+      { sh: 0x188, name: '.text', va: 0x1000, ptr: 0x400, size: 0x11000 },
+      { sh: 0x1B0, name: '.rdata', va: 0x20000, ptr: 0x12000, size: 0x1E000 }
+    ];
+    for (const s of sections) {
+      const nb = Buffer.alloc(8, 0);
+      nb.write(s.name, 0, 'ascii');
+      nb.copy(data, s.sh);
+      data.writeUInt32LE(s.size, s.sh + 8);
+      data.writeUInt32LE(s.va, s.sh + 12);
+      data.writeUInt32LE(s.size, s.sh + 16);
+      data.writeUInt32LE(s.ptr, s.sh + 20);
+    }
+    const text = 0x500;
+    data.fill(0xCC, text, text + 0x10000);
+    Buffer.from('81fa00e80300be00e803000f42f2', 'hex').copy(data, text + 3 * 64);
+    const expOff = text + 4 * 64;
+    data[expOff] = 0xE8;
+    data.writeInt32LE(64 - 5, expOff + 1);
+    data[expOff + 5] = 0x84;
+    data[expOff + 6] = 0xC0;
+    data[expOff + 7] = 0x75;
+    data.writeInt8(5, expOff + 8);
+
+    const base = 0x12000;
+    const count = 1001;
+    const namesOffset = 0x100;
+    const tableOffset = 0x5000;
+    data.writeUInt32LE(unlock.PCLNTAB_MAGIC, base);
+    data[base + 6] = 1;
+    data[base + 7] = 8;
+    data.writeBigUInt64LE(BigInt(count), base + 8);
+    data.writeBigUInt64LE(0x140001100n, base + 24);
+    data.writeBigUInt64LE(BigInt(namesOffset), base + 32);
+    data.writeBigUInt64LE(BigInt(tableOffset), base + 64);
+    const names = [
+      'pkg/' + unlock.FUNC_OFFERS,
+      'pkg/' + unlock.FUNC_STORE_CW,
+      'pkg/' + unlock.FUNC_STORE_CHOICE,
+      'pkg/' + unlock.FUNC_CHECKPOINT,
+      'pkg/' + unlock.FUNC_EXP_CHECKPOINT,
+      'pkg/' + unlock.FUNC_SELECT_EXP_KEY
+    ];
+    let namepos = 0;
+    const records = (count + 1) * 8;
+    for (let i = 0; i < count; i++) {
+      const fnName = (i < names.length ? names[i] : `pkg/f${i}`) + '\0';
+      data.write(fnName, base + namesOffset + namepos, 'ascii');
+      data.writeUInt32LE(i * 64, base + tableOffset + i * 8);
+      data.writeUInt32LE(records + i * 8, base + tableOffset + i * 8 + 4);
+      data.writeUInt32LE(i * 64, base + tableOffset + records + i * 8);
+      data.writeInt32LE(namepos, base + tableOffset + records + i * 8 + 4);
+      namepos += fnName.length;
+    }
+    data.writeUInt32LE(count * 64, base + tableOffset + count * 8);
+    return data;
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-renderer-unlock-e2e-'));
+  const resDir = path.join(tmpDir, 'resources');
+  const binDir = path.join(resDir, 'bin');
+  const stateDir = path.join(tmpDir, 'state');
+  fs.mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, 'language_server_windows_x64.exe');
+  const origPe = buildRendererPeFixture();
+  const origSha = crypto.createHash('sha256').update(origPe).digest('hex');
+  fs.writeFileSync(binPath, origPe);
+
+  let currentPlatform = 'win32';
+  let currentRuntimeMode = 'electron';
+  let forceHotRenameNext = false;
+  let blockManifestWriteNext = false;
+  let blockTxWriteNext = false;
+  const lockedOldPaths = new Set();
+  const mockFs = Object.create(fs);
+  mockFs.openSync = (p, flags, ...rest) => {
+    if (blockManifestWriteNext && String(p).includes('unlock-manifest-') && String(flags).includes('w')) {
+      const e = new Error('manifest write EACCES');
+      e.code = 'EACCES';
+      throw e;
+    }
+    if (blockTxWriteNext && String(p).includes('unlock-tx-') && String(flags).includes('w')) {
+      const e = new Error('tx write EACCES');
+      e.code = 'EACCES';
+      throw e;
+    }
+    return fs.openSync(p, flags, ...rest);
+  };
+  mockFs.unlinkSync = p => {
+    if (lockedOldPaths.has(String(p))) {
+      const e = new Error('running process image locked');
+      e.code = 'EPERM';
+      throw e;
+    }
+    return fs.unlinkSync(p);
+  };
+  const hostEnvOpts = () => ({
+    runtimeMode: currentRuntimeMode,
+    origin: 'https://127.0.0.1:49876',
+    _resolveLiveInstance: async () => ({
+      ok: true,
+      binaryPath: binPath,
+      binDir,
+      source: 'live_process',
+      instanceIdentity: { pid: 7788, creationDate: '2026-11-11T01:22:00Z', executablePath: binPath, port: 49876 }
+    }),
+    _testResourcesPath: resDir,
+    _testStateDir: stateDir,
+    platform: currentPlatform,
+    fs: mockFs,
+    inProcess: true
+  });
+
   const h = harness();
   h.finishScan();
-
-  let mockUnlockStatus = {
-    ok: true,
-    supported: true,
-    targetPath: 'C:\\App\\resources\\app\\extensions\\antigravity\\bin\\language_server_windows_x64.exe',
-    currentSha256: 'sha256_orig_256k',
-    instanceIdentity: { appRoot: 'C:\\App\\resources\\app', targetId: 'abcd1234ef567890' },
-    overallState: 'ORIGINAL_256K',
-    tierKey: 'original_256k',
-    tierLabel: '256K (默认)',
-    capTokens: 262144,
-    gate3A: { state: '256K', patchVA: 0x10023a },
-    gate3B: { state: 'UNPATCHED', patchVA: 0x100426, patchLength: 2 },
-    backup: { exists: false, valid: false },
-    canWrite: true,
-    canRestore: false,
-    needsRecovery: false,
-    runtimeState: 'unknown',
-    cleanupState: { committedOldFiles: 0 }
+  const flushAsync = async () => {
+    for (let i = 0; i < 8; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
   };
 
   const calls = [];
   h.sandbox.window.contextMeterAPI = {
     ...h.sandbox.window.contextMeterAPI,
-    getUnlockStatus: async () => {
-      calls.push({ fn: 'status' });
-      return { ...mockUnlockStatus };
+    getUnlockStatus: async (opts) => {
+      calls.push({ fn: 'status', opts });
+      return await unlock.getUnlockStatus({ ...unlock.sanitizePublicUnlockOptions(opts), ...hostEnvOpts() });
     },
     dryRunUnlock: async (opts) => {
       calls.push({ fn: 'dry-run', opts });
-      return {
-        ok: true,
-        willChange: true,
-        beforeSha256: mockUnlockStatus.currentSha256,
-        instanceIdentity: mockUnlockStatus.instanceIdentity,
-        targetSpec: { tier: opts.target.tier, label: opts.target.tier === 'custom' ? `${opts.target.customK}K (自定义)` : '512K (v4)' },
-        gate3A: { patchVA: 0x10023a },
-        gate3B: { patchVA: 0x100426, patchLength: 2 }
-      };
+      return await unlock.dryRunUnlock({ ...unlock.sanitizePublicUnlockOptions(opts), ...hostEnvOpts() });
     },
     applyUnlock: async (opts) => {
       calls.push({ fn: 'apply', opts });
-      mockUnlockStatus = {
-        ...mockUnlockStatus,
-        currentSha256: 'sha256_patched_512k',
-        overallState: 'PATCHED_VERIFIED',
-        tierKey: opts.target.tier,
-        tierLabel: opts.target.tier === '1m' ? '1M (1,000,000)' : (opts.target.tier === 'custom' ? `${opts.target.customK}K (自定义)` : '512K (v4)'),
-        capTokens: opts.target.tier === '1m' ? 1000000 : 524288,
-        gate3A: { state: 'BOUNDED_CUSTOM', patchVA: 0x10023a },
-        gate3B: { state: 'VERIFIED_PATCHED', patchVA: 0x100426, patchLength: 2 },
-        backup: { exists: true, valid: true },
-        canWrite: true,
-        canRestore: true,
-        runtimeState: 'pending_restart',
-        cleanupState: { committedOldFiles: 1 }
-      };
-      return {
-        ok: true,
-        changed: true,
-        strategy: 'hot_rename',
-        targetSpec: { tier: opts.target.tier, label: mockUnlockStatus.tierLabel }
-      };
+      const extra = forceHotRenameNext
+        ? {
+            _forceHotRename: true,
+            _onAfterOldMoved: async ({ oldPath }) => { lockedOldPaths.add(String(oldPath)); }
+          }
+        : {};
+      forceHotRenameNext = false;
+      return await unlock.applyUnlock({ ...unlock.sanitizePublicUnlockOptions(opts), ...hostEnvOpts(), ...extra });
     },
-    restoreUnlock: async () => {
-      calls.push({ fn: 'restore' });
-      mockUnlockStatus = {
-        ...mockUnlockStatus,
-        currentSha256: 'sha256_orig_256k',
-        overallState: 'ORIGINAL_256K',
-        tierKey: 'original_256k',
-        tierLabel: '256K (默认)',
-        capTokens: 262144,
-        gate3A: { state: '256K', patchVA: 0x10023a },
-        gate3B: { state: 'UNPATCHED', patchVA: 0x100426, patchLength: 2 },
-        backup: { exists: true, valid: true },
-        canWrite: true,
-        canRestore: false,
-        runtimeState: 'pending_restart'
-      };
-      return { ok: true, restored: true };
+    restoreUnlock: async (opts) => {
+      calls.push({ fn: 'restore', opts });
+      return await unlock.restoreUnlock({ ...unlock.sanitizePublicUnlockOptions(opts), ...hostEnvOpts() });
     },
-    recoverUnlock: async () => {
-      calls.push({ fn: 'recover' });
-      mockUnlockStatus = { ...mockUnlockStatus, needsRecovery: false, canWrite: true };
-      return { ok: true, recovered: true };
+    recoverUnlock: async (opts) => {
+      calls.push({ fn: 'recover', opts });
+      return await unlock.recoverUnlockTransaction({ ...unlock.sanitizePublicUnlockOptions(opts), ...hostEnvOpts() });
     }
   };
 
   const api = h.sandbox.__AGContextMeter;
 
-  // 1. Open unlock drawer and verify initial 256K status
-  h.elements.get('btn-toggle-unlock').click();
-  await h.flush();
-  assert.equal(h.elements.get('unlock-drawer-body').style.display, 'block');
-  assert.equal(h.elements.get('unlock-header-pill').textContent, '磁盘: 256K 默认');
-  assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
-  assert.equal(h.elements.get('btn-unlock-apply').disabled, false);
+  try {
+    // 1. 打开抽屉并核对真实 256K 初始状态（不再误报红色“状态异常”）
+    h.elements.get('btn-toggle-unlock').click();
+    await flushAsync();
+    assert.equal(h.elements.get('unlock-drawer-body').style.display, 'block');
+    assert.equal(h.elements.get('unlock-header-pill').textContent, '磁盘: 256K 默认');
+    assert.match(h.elements.get('unlock-disk-status').textContent, /256K \(默认\).*Gate 3B: UNPATCHED/);
+    assert.match(h.elements.get('unlock-backup-status').textContent, /尚未创建/);
+    assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
+    assert.equal(h.elements.get('btn-unlock-apply').disabled, false);
 
-  // 2. Select 512K, run dry-run, then apply
-  h.elements.get('unlock-tier-512k').click();
-  h.elements.get('btn-unlock-dry-run').click();
-  await h.flush();
-  assert.match(h.elements.get('unlock-feedback-box').textContent, /预检通过.*512K/);
+    // 2. 选择 1M (1000K) 档位（验证不会退回 512K），执行 Dry-Run 与热重命名 Apply
+    h.elements.get('unlock-tier-1m').click();
+    h.elements.get('btn-unlock-dry-run').click();
+    await flushAsync();
+    assert.match(h.elements.get('unlock-feedback-box').textContent, /预检通过.*1M \(1000K\).*0x14000.*2B.*将写入新机器码/);
 
-  h.elements.get('btn-unlock-apply').click();
-  await h.flush();
-  const applyCall = calls.find(c => c.fn === 'apply');
-  assert.ok(applyCall);
-  assert.equal(applyCall.opts.expectedBeforeSha256, 'sha256_orig_256k');
-  assert.deepEqual(applyCall.opts.expectedInstanceIdentity, { appRoot: 'C:\\App\\resources\\app', targetId: 'abcd1234ef567890' });
-  assert.match(h.elements.get('unlock-header-pill').textContent, /待重启/);
-  assert.match(h.elements.get('unlock-feedback-box').textContent, /NTFS 热重命名替换/);
-  assert.equal(h.elements.get('btn-unlock-restore').disabled, false);
+    forceHotRenameNext = true;
+    h.elements.get('btn-unlock-apply').click();
+    await flushAsync();
+    const applyCall = calls.find(c => c.fn === 'apply');
+    assert.ok(applyCall);
+    assert.equal(applyCall.opts.mode, '1m');
+    assert.equal(applyCall.opts.expectedBeforeSha256, origSha);
+    assert.equal(h.elements.get('unlock-header-pill').textContent, '⏳ 待重启 (1M (1000K))');
+    assert.match(h.elements.get('unlock-backup-status').textContent, /已验证同构建原版 \.bak/);
+    assert.match(h.elements.get('unlock-feedback-box').textContent, /1M \(1000K\).*NTFS 热重命名替换/);
+    assert.match(h.elements.get('unlock-runtime-status').textContent, /残留 \.old 文件 1 个/);
+    assert.equal(h.elements.get('btn-unlock-restore').disabled, false);
+    lockedOldPaths.clear();
 
-  // 3. Test custom tier selection (768K)
-  h.elements.get('unlock-tier-custom').click();
-  assert.equal(h.elements.get('unlock-custom-row').style.display, 'flex');
-  const customInput = h.elements.get('unlock-custom-k-input');
-  customInput.value = '768';
-  customInput.trigger('input', { target: { value: '768' } });
-  h.elements.get('btn-unlock-dry-run').click();
-  await h.flush();
-  assert.match(h.elements.get('unlock-feedback-box').textContent, /768K/);
+    // 3. 测试自定义档位 768K（严格验证 1K = 1,000 tokens -> 768,000）
+    h.elements.get('unlock-tier-custom').click();
+    assert.equal(h.elements.get('unlock-custom-row').style.display, 'flex');
+    const customInput = h.elements.get('unlock-custom-k-input');
+    customInput.value = '768';
+    customInput.trigger('input', { target: { value: '768' } });
+    h.elements.get('btn-unlock-apply').click();
+    await flushAsync();
+    const diskCheck768 = await unlock.getUnlockStatus(hostEnvOpts());
+    assert.equal(diskCheck768.diskState.capTokens, 768000);
+    assert.match(h.elements.get('unlock-header-pill').textContent, /768K/);
 
-  // 4. Test read-only unverified patch state (no backup) -> disables apply/dry-run/restore
-  mockUnlockStatus = {
-    ...mockUnlockStatus,
-    overallState: 'PATCHED_UNVERIFIED_READONLY',
-    tierLabel: '512K (外部补丁)',
-    backup: { exists: false, valid: false },
-    canWrite: false,
-    canRestore: false,
-    runtimeState: 'unknown'
-  };
-  await api.refreshUnlockStatus();
-  assert.match(h.elements.get('unlock-header-pill').textContent, /只读/);
-  assert.equal(h.elements.get('btn-unlock-apply').disabled, true);
-  assert.equal(h.elements.get('btn-unlock-dry-run').disabled, true);
-  assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
+    // 4. 切换到 Live 模式验证提交后写 manifest 失败的“部分成功”UI 告警展示，以及界面还原传递 expectedInstanceIdentity
+    currentRuntimeMode = 'live';
+    await api.refreshUnlockStatus();
+    blockManifestWriteNext = true;
+    h.elements.get('unlock-tier-512k').click();
+    h.elements.get('btn-unlock-apply').click();
+    await flushAsync();
+    assert.equal(h.elements.get('unlock-feedback-box').getAttribute('data-tone'), 'warn');
+    assert.match(h.elements.get('unlock-feedback-box').textContent, /部分成功.*512K.*同步状态清单失败/);
+    assert.equal(h.elements.get('btn-unlock-recover').style.display, 'inline-block', 'manifest 待补同步时暴露恢复按钮');
 
-  // 5. Test needsRecovery state and recover button
-  mockUnlockStatus = {
-    ...mockUnlockStatus,
-    ok: false,
-    code: 'UNFINISHED_TRANSACTION',
-    error: '存在未完成的替换事务 (OLD_MOVED)',
-    needsRecovery: true,
-    canWrite: false,
-    canRestore: false
-  };
-  await api.refreshUnlockStatus();
-  assert.equal(h.elements.get('unlock-header-pill').textContent, '⚠ 事务待恢复');
-  assert.equal(h.elements.get('btn-unlock-recover').style.display, 'inline-block');
-  h.elements.get('btn-unlock-recover').click();
-  await h.flush();
-  assert.ok(calls.some(c => c.fn === 'recover'));
+    // 恢复 manifest 可写后点击完整还原原版 (.bak)，验证 restore 调用携带 expectedInstanceIdentity 与 expectedBeforeSha256，且磁盘回到初始哈希
+    blockManifestWriteNext = false;
+    const sha512BeforeRestore = (await unlock.getUnlockStatus(hostEnvOpts())).diskState.sha256;
+    h.elements.get('btn-unlock-restore').click();
+    await flushAsync();
+    const restoreCall = calls.filter(c => c.fn === 'restore').pop();
+    assert.ok(restoreCall);
+    assert.equal(restoreCall.opts.expectedInstanceIdentity.pid, 7788);
+    assert.equal(restoreCall.opts.expectedInstanceIdentity.creationDate, '2026-11-11T01:22:00Z');
+    assert.deepEqual(
+      unlock.sanitizePublicUnlockOptions(restoreCall.opts).expectedInstanceIdentity,
+      { pid: 7788, creationDate: '2026-11-11T01:22:00Z' }
+    );
+    assert.equal(restoreCall.opts.expectedBeforeSha256, sha512BeforeRestore);
+    assert.equal(crypto.createHash('sha256').update(fs.readFileSync(binPath)).digest('hex'), origSha);
+    assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
+    currentRuntimeMode = 'electron';
 
-  // 6. Verify 100% zero coupling between unlock state and d.budget / #key-limit across all 3 scenarios:
-  // (a) Normal reported budget (256000 -> 256K) even while unlock status is 1M / 512K
-  h.pending[0].resolve(response({
-    usage: { inputTokens: 120000, outputTokens: 1000 },
-    chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
-  }));
-  await h.flush();
-  assert.equal(api.snapshot().latest.budget, 256000);
-  assert.equal(h.elements.get('key-limit').textContent, '256K');
+    // 5. 模拟外部未验证补丁（删除 .bak 并写入 512K + 90 90）-> 只读状态禁用写入与还原
+    fs.unlinkSync(binPath + '.bak');
+    const extPatched = Buffer.from(origPe);
+    Buffer.from('81fa00d00700be00d007000f42f2', 'hex').copy(extPatched, 0x500 + 3 * 64);
+    extPatched[0x500 + 4 * 64 + 7] = 0x90;
+    extPatched[0x500 + 4 * 64 + 8] = 0x90;
+    fs.writeFileSync(binPath, extPatched);
+    unlock.invalidateUnlockStatusCache();
 
-  // (b) Missing budget -> #key-limit is '—' (never substituted by local unlock capTokens)
-  h.sandbox.location.pathname = '/c/33333333-3333-3333-3333-333333333333';
-  h.tick();
-  h.finishScan(1);
-  h.pending[1].resolve(response({
-    usage: { inputTokens: 50000, outputTokens: 500 }
-  }));
-  await h.flush();
-  assert.equal(api.snapshot().latest.budget, null);
-  assert.equal(h.elements.get('key-limit').textContent, '—');
+    await api.refreshUnlockStatus();
+    assert.match(h.elements.get('unlock-header-pill').textContent, /只读/);
+    assert.equal(h.elements.get('btn-unlock-apply').disabled, true);
+    assert.equal(h.elements.get('btn-unlock-dry-run').disabled, true);
+    assert.equal(h.elements.get('btn-unlock-restore').disabled, true);
 
-  // (c) Error without budget -> preserves 983040 (983K) fallback in #key-limit
-  h.sandbox.location.pathname = '/c/44444444-4444-4444-4444-444444444444';
-  h.tick();
-  h.finishScan(2);
-  h.pending[2].resolve(response({
-    usage: { inputTokens: 80000, outputTokens: 200 },
-    retryInfos: [{ error: 'request failed: stream idle timeout (5m0s): context deadline exceeded', usage: { model: 'gemini' } }]
-  }));
-  await h.flush();
-  assert.equal(h.elements.get('key-limit').textContent, '983K');
+    // 6. 模拟未完成事务中断 (OLD_MOVED) -> 展示恢复按钮并成功恢复回 256K 原版
+    fs.writeFileSync(binPath, origPe);
+    unlock.invalidateUnlockStatusCache();
+    await unlock.applyUnlock({
+      ...hostEnvOpts(),
+      mode: '512k',
+      _forceHotRename: true,
+      _onAfterOldMoved: async () => {
+        throw new Error('simulated UI crash at OLD_MOVED');
+      }
+    }).catch(() => {});
 
-  // Restore original 256K and verify #key-limit is still untouched
-  mockUnlockStatus = {
-    ...mockUnlockStatus,
-    ok: true,
-    overallState: 'PATCHED_VERIFIED',
-    canWrite: true,
-    canRestore: true,
-    needsRecovery: false
-  };
-  await api.refreshUnlockStatus();
-  h.elements.get('btn-unlock-restore').click();
-  await h.flush();
-  assert.ok(calls.some(c => c.fn === 'restore'));
-  assert.equal(h.elements.get('key-limit').textContent, '983K');
+    await api.refreshUnlockStatus();
+    assert.equal(h.elements.get('unlock-header-pill').textContent, '⚠ 事务待恢复');
+    assert.match(h.elements.get('unlock-disk-status').textContent, /未完成的替换事务/);
+    assert.equal(h.elements.get('btn-unlock-recover').style.display, 'inline-block');
 
-  api.dispose();
+    // 先注入恢复后写事务日志 EACCES：验证界面显示“文件已恢复，事务记录待同步”，文件实际已恢复落盘且恢复按钮保持可见
+    blockTxWriteNext = true;
+    h.elements.get('btn-unlock-recover').click();
+    await flushAsync();
+    assert.ok(calls.some(c => c.fn === 'recover'));
+    assert.equal(crypto.createHash('sha256').update(fs.readFileSync(binPath)).digest('hex'), origSha);
+    assert.equal(h.elements.get('unlock-feedback-box').getAttribute('data-tone'), 'warn');
+    assert.match(h.elements.get('unlock-feedback-box').textContent, /部分成功：文件已恢复，事务记录待同步.*EACCES/);
+    assert.equal(h.elements.get('btn-unlock-recover').style.display, 'inline-block');
+
+    // 解除事务日志写入阻塞后再次点击恢复，完成终态事务记录同步
+    blockTxWriteNext = false;
+    h.elements.get('btn-unlock-recover').click();
+    await flushAsync();
+    assert.equal(h.elements.get('unlock-feedback-box').getAttribute('data-tone'), 'ok');
+    assert.match(h.elements.get('unlock-feedback-box').textContent, /事务恢复完成/);
+    assert.equal(h.elements.get('btn-unlock-recover').style.display, 'none');
+
+    // 7. 非 Windows 平台优雅提示“仅支持 Win x64”
+    currentPlatform = 'darwin';
+    await api.refreshUnlockStatus();
+    assert.equal(h.elements.get('unlock-header-pill').textContent, '仅支持 Win x64');
+    assert.equal(h.elements.get('btn-unlock-apply').disabled, true);
+    currentPlatform = 'win32';
+
+    // 8. 验证与 d.budget 和 #key-limit 的 100% 零耦合（正常预算 / 无预算 / 错误 983K 回退）
+    h.pending[0].resolve(response({
+      usage: { inputTokens: 120000, outputTokens: 1000 },
+      chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
+    }));
+    await h.flush();
+    assert.equal(api.snapshot().latest.budget, 256000);
+    assert.equal(h.elements.get('key-limit').textContent, '256K');
+
+    h.sandbox.location.pathname = '/c/33333333-3333-3333-3333-333333333333';
+    h.tick();
+    h.finishScan(1);
+    h.pending[1].resolve(response({
+      usage: { inputTokens: 50000, outputTokens: 500 }
+    }));
+    await h.flush();
+    assert.equal(api.snapshot().latest.budget, null);
+    assert.equal(h.elements.get('key-limit').textContent, '—');
+
+    h.sandbox.location.pathname = '/c/44444444-4444-4444-4444-444444444444';
+    h.tick();
+    h.finishScan(2);
+    h.pending[2].resolve(response({
+      usage: { inputTokens: 80000, outputTokens: 200 },
+      retryInfos: [{ error: 'request failed: stream idle timeout (5m0s): context deadline exceeded', usage: { model: 'gemini' } }]
+    }));
+    await h.flush();
+    assert.equal(h.elements.get('key-limit').textContent, '983K');
+  } finally {
+    api.dispose();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

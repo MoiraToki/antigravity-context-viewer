@@ -482,11 +482,12 @@ test('更新安全 4.4：受控重定向白名单校验', () => {
   assert.equal(isAllowedDownloadRedirectUrl('https://malicious-site.com/payload.zip'), false, '拦截未授权第三方域名');
   assert.equal(isAllowedDownloadRedirectUrl('https://objects.githubusercontent.com/github-production-release-asset-2e65be/12345'), true);
   assert.equal(isAllowedDownloadRedirectUrl('https://github-production-release-asset-2e65be.s3.amazonaws.com/12345'), true);
-  assert.equal(isAllowedDownloadRedirectUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases'), true);
+  assert.equal(isAllowedDownloadRedirectUrl(`https://github.com/${OFFICIAL_REPO}/releases`), true);
 
-  assert.equal(isOfficialAssetDownloadUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/download/v0.9.0/checksums.txt', 'checksums.txt'), true);
+  assert.equal(isOfficialAssetDownloadUrl(`https://github.com/${OFFICIAL_REPO}/releases/download/v0.9.0/checksums.txt`, 'checksums.txt'), true);
+  assert.equal(isOfficialAssetDownloadUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/download/v0.9.0/checksums.txt', 'checksums.txt'), false);
   assert.equal(isOfficialAssetDownloadUrl('https://github.com/attacker/antigravity-context-viewer/releases/download/v0.9.0/checksums.txt', 'checksums.txt'), false);
-  assert.equal(isOfficialAssetDownloadUrl('https://evil.com/elviscjn-cjn/antigravity-context-viewer/releases/download/v0.9.0/checksums.txt', 'checksums.txt'), false);
+  assert.equal(isOfficialAssetDownloadUrl(`https://evil.com/${OFFICIAL_REPO}/releases/download/v0.9.0/checksums.txt`, 'checksums.txt'), false);
 });
 
 test('更新安全 4.5：checksums.txt 缺失哈希记录或哈希不匹配时拒绝执行安装入口，清理临时文件', async () => {

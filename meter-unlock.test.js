@@ -1029,3 +1029,693 @@ test('仅清理 manifest.retiredOldFiles 中登记且哈希匹配的旧文件，
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('外部参数白名单清洗、生产子进程 OLD_MOVED 缺失时返回 UNFINISHED_TRANSACTION 及 restore 防覆盖旧备份校验', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-boundary-'));
+  const stateDir = path.join(tmpDir, 'state');
+  try {
+    // 1. 验证 sanitizePublicUnlockOptions 彻底剥离内部测试与执行钩子，并兼容嵌套 target
+    const sanitized = unlock.sanitizePublicUnlockOptions({
+      target: { tier: 'custom', customK: 768 },
+      expectedBeforeSha256: 'abc123',
+      expectedInstanceIdentity: { pid: 4321, creationDate: '20261111', extra: 'ignored' },
+      _testResourcesPath: 'C:\\evil\\resources',
+      _testStateDir: 'C:\\evil\\state',
+      inProcess: true,
+      binaryPath: 'C:\\evil\\language_server.exe',
+      _forceHotRename: true,
+      platform: 'linux'
+    }, { runtimeMode: 'electron' });
+
+    assert.equal(sanitized.runtimeMode, 'electron');
+    assert.equal(sanitized.tier, 'custom');
+    assert.equal(sanitized.customK, 768);
+    assert.equal(sanitized.expectedBeforeSha256, 'abc123');
+    assert.deepEqual(sanitized.expectedInstanceIdentity, { pid: 4321, creationDate: '20261111' });
+    assert.equal(sanitized._testResourcesPath, undefined);
+    assert.equal(sanitized._testStateDir, undefined);
+    assert.equal(sanitized.inProcess, undefined);
+    assert.equal(sanitized.binaryPath, undefined);
+    assert.equal(sanitized._forceHotRename, undefined);
+    assert.equal(sanitized.platform, undefined);
+
+    // 2. 验证客户端升级为未修改 v2 (256K) 且残留 v1 .bak 时，restoreUnlock 拒绝覆盖且不修改旧 .bak
+    const binDir = path.join(tmpDir, 'resources', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const binPath = path.join(binDir, 'language_server_windows_x64.exe');
+    const v1Orig = createPeFixture({ extraNonPatchByte: 0x33 });
+    const v2Orig = createPeFixture({ extraNonPatchByte: 0x44 });
+    fs.writeFileSync(binPath, v2Orig);
+    fs.writeFileSync(binPath + '.bak', v1Orig);
+
+    const badRestore = await unlock.restoreUnlock({
+      runtimeMode: 'cli',
+      binaryPath: binPath,
+      _testStateDir: stateDir
+    });
+    assert.equal(badRestore.ok, false);
+    assert.equal(badRestore.code, 'REFUSED_NO_VERIFIED_BACKUP');
+    assert.equal(sha256(fs.readFileSync(binPath + '.bak')), sha256(v1Orig), 'restoreUnlock 绝不能用当前新版覆盖不匹配的 .bak');
+
+    // 3. 验证真实子进程模式（不传 inProcess）在 OLD_MOVED 目标文件缺失时，applyUnlock / restoreUnlock 准确返回 UNFINISHED_TRANSACTION 而非 BINARY_NOT_FOUND
+    fs.unlinkSync(binPath + '.bak');
+    fs.writeFileSync(binPath, v2Orig);
+    await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: binPath,
+      mode: '512k',
+      _testStateDir: stateDir,
+      _forceHotRename: true,
+      inProcess: true,
+      _onAfterOldMoved: async () => {
+        throw new Error('simulated crash at OLD_MOVED');
+      }
+    }).catch(() => {});
+    assert.equal(fs.existsSync(binPath), false);
+
+    const subApply = await unlock.applyUnlock({
+      runtimeMode: 'electron',
+      _testResourcesPath: path.join(tmpDir, 'resources'),
+      _testStateDir: stateDir,
+      mode: '1m'
+    });
+    assert.equal(subApply.ok, false);
+    assert.equal(subApply.code, 'UNFINISHED_TRANSACTION');
+
+    const subRestore = await unlock.restoreUnlock({
+      runtimeMode: 'electron',
+      _testResourcesPath: path.join(tmpDir, 'resources'),
+      _testStateDir: stateDir
+    });
+    assert.equal(subRestore.ok, false);
+    assert.equal(subRestore.code, 'UNFINISHED_TRANSACTION');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('[P1] 加载 meter-unlock.js 绝不设置全局 process.noAsar，避免破坏宿主 Electron ASAR 读取', async () => {
+  const unlockPath = path.resolve(__dirname, 'meter-unlock.js');
+  const rawSource = fs.readFileSync(unlockPath, 'utf8');
+  assert.equal(/\bprocess\.noAsar\s*=/.test(rawSource), false, 'meter-unlock.js 严禁全局修改 process.noAsar');
+
+  const checkRes = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      '-e',
+      `const before = process.noAsar; require(${JSON.stringify(unlockPath)}); process.stdout.write(JSON.stringify({ before, after: process.noAsar }));`
+    ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', d => { out += d.toString('utf8'); });
+    child.stderr.on('data', d => { err += d.toString('utf8'); });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code !== 0) return reject(new Error(err || `exit ${code}`));
+      resolve(JSON.parse(out));
+    });
+  });
+
+  assert.equal(checkRes.before, undefined);
+  assert.equal(checkRes.after, undefined);
+});
+
+test('[P1] Live 实例复核：在持锁替换前二次确认端口归属与 (pid, creationDate)，涵盖 inProcess 与真实 Worker 子进程', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-live-recheck-'));
+  const stateDir = path.join(tmpDir, 'state');
+  try {
+    const binDir = path.join(tmpDir, 'resources', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const targetPath = path.join(binDir, 'language_server_windows_x64.exe');
+    const orig = createPeFixture();
+    const origSha = sha256(orig);
+    fs.writeFileSync(targetPath, orig);
+
+    // 1. 不传 expectedInstanceIdentity 时，首次反查返回 PID 1001，锁内二次反查返回 PID 2002：必须拒绝写入且 0 改动
+    let applyLiveCalls = 0;
+    const applyRaceRes = await unlock.applyUnlock({
+      runtimeMode: 'live',
+      origin: 'https://127.0.0.1:45123',
+      mode: '512k',
+      _testStateDir: stateDir,
+      _resolveLiveInstance: async () => {
+        applyLiveCalls++;
+        const pid = applyLiveCalls === 1 ? 1001 : 2002;
+        return {
+          ok: true,
+          binaryPath: targetPath,
+          binDir,
+          source: 'live_process',
+          instanceIdentity: {
+            pid,
+            creationDate: `2026-11-11T01:00:0${applyLiveCalls}.0000000Z`,
+            executablePath: targetPath,
+            port: 45123
+          }
+        };
+      }
+    });
+    assert.equal(applyLiveCalls, 2, 'applyUnlock 必须在初始定位和锁内写入前共执行 2 次实例反查');
+    assert.equal(applyRaceRes.ok, false);
+    assert.equal(applyRaceRes.code, 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED');
+    assert.equal(fs.existsSync(`${targetPath}.bak`), false, '实例变更时绝不能写出 .bak');
+    assert.equal(sha256(fs.readFileSync(targetPath)), origSha);
+
+    // 先正常打上 512K 补丁，随后注入 restoreUnlock 锁内实例变更
+    const validApply = await unlock.applyUnlock({
+      runtimeMode: 'live',
+      origin: 'https://127.0.0.1:45123',
+      mode: '512k',
+      _testStateDir: stateDir,
+      _resolveLiveInstance: async () => ({
+        ok: true,
+        binaryPath: targetPath,
+        binDir,
+        source: 'live_process',
+        instanceIdentity: { pid: 1001, creationDate: '2026-11-11T01:00:00Z', executablePath: targetPath, port: 45123 }
+      })
+    });
+    assert.equal(validApply.ok, true);
+    const sha512 = sha256(fs.readFileSync(targetPath));
+
+    let restoreLiveCalls = 0;
+    const restoreRaceRes = await unlock.restoreUnlock({
+      runtimeMode: 'live',
+      origin: 'https://127.0.0.1:45123',
+      _testStateDir: stateDir,
+      _resolveLiveInstance: async () => {
+        restoreLiveCalls++;
+        return {
+          ok: true,
+          binaryPath: targetPath,
+          binDir,
+          source: 'live_process',
+          instanceIdentity: {
+            pid: restoreLiveCalls === 1 ? 1001 : 3003,
+            creationDate: '2026-11-11T01:00:00Z',
+            executablePath: targetPath,
+            port: 45123
+          }
+        };
+      }
+    });
+    assert.equal(restoreLiveCalls, 2, 'restoreUnlock 必须在初始定位和锁内写入前共执行 2 次实例反查');
+    assert.equal(restoreRaceRes.ok, false);
+    assert.equal(restoreRaceRes.code, 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED');
+    assert.equal(sha256(fs.readFileSync(targetPath)), sha512);
+
+    // 2. 真实 Worker 子进程模式 (inProcess 未开启)：验证父进程将可信实例身份与 origin 传入真实 Worker 子进程，
+    //    且第 2 次查询确实发生在独立 Worker PID 内部并处于持锁状态！
+    const workerTargetPath = path.join(tmpDir, 'worker_live_bin', 'language_server.exe');
+    fs.mkdirSync(path.dirname(workerTargetPath), { recursive: true });
+    fs.writeFileSync(workerTargetPath, orig);
+    const workerStateDir = path.join(tmpDir, 'worker_live_state');
+    const { lockDir: workerLockDir } = unlock.getTargetArtifactPaths(workerTargetPath, { _testStateDir: workerStateDir });
+    const traceLogPath = path.join(tmpDir, 'ps-trace.jsonl');
+    const preloadScriptPath = path.join(tmpDir, 'mock-ps-preload.js');
+
+    fs.writeFileSync(preloadScriptPath, `
+      'use strict';
+      const fs = require('fs');
+      const cp = require('child_process');
+      const { EventEmitter } = require('events');
+      const { PassThrough } = require('stream');
+      const origSpawn = cp.spawn;
+      cp.spawn = function(cmd, args, opts) {
+        if (String(cmd).toLowerCase() === 'powershell.exe') {
+          let seq = 1;
+          try {
+            if (fs.existsSync(${JSON.stringify(traceLogPath)})) {
+              seq = fs.readFileSync(${JSON.stringify(traceLogPath)}, 'utf8').trim().split(/\\r?\\n/).filter(Boolean).length + 1;
+            }
+          } catch {}
+          const lockHeld = fs.existsSync(${JSON.stringify(workerLockDir)});
+          fs.appendFileSync(${JSON.stringify(traceLogPath)}, JSON.stringify({ seq, callerPid: process.pid, lockHeld }) + '\\n');
+          const mode = process.env.TEST_LIVE_PS_MODE || 'change_pid';
+          const pid = (mode === 'change_pid' && seq >= 2) ? 9002 : 9001;
+          const payload = JSON.stringify({
+            ok: true,
+            pid,
+            name: 'language_server.exe',
+            executablePath: ${JSON.stringify(workerTargetPath)},
+            creationDate: '2026-11-11T01:30:00.0000000Z',
+            parentPid: 100
+          });
+          const fake = new EventEmitter();
+          fake.stdout = new PassThrough();
+          fake.stderr = new PassThrough();
+          fake.kill = () => {};
+          setImmediate(() => {
+            fake.stdout.end(payload);
+            fake.emit('close', 0);
+          });
+          return fake;
+        }
+        return origSpawn.apply(this, arguments);
+      };
+    `, 'utf8');
+
+    const runParentScript = modeEnv => new Promise((resolve, reject) => {
+      const driver = `
+        const unlock = require(${JSON.stringify(path.resolve(__dirname, 'meter-unlock.js'))});
+        (async () => {
+          const res = await unlock.applyUnlock({
+            runtimeMode: 'live',
+            origin: 'https://127.0.0.1:56789',
+            mode: '512k',
+            _testStateDir: ${JSON.stringify(workerStateDir)},
+            platform: 'win32'
+          });
+          process.stdout.write(JSON.stringify({ parentPid: process.pid, res }) + '\\n');
+        })().catch(e => { console.error(e); process.exit(1); });
+      `;
+      const env = {
+        ...process.env,
+        TEST_LIVE_PS_MODE: modeEnv,
+        NODE_OPTIONS: `--require ${JSON.stringify(preloadScriptPath)}`
+      };
+      const child = spawn(process.execPath, ['-e', driver], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      let out = '';
+      let err = '';
+      child.stdout.on('data', d => { out += d.toString('utf8'); });
+      child.stderr.on('data', d => { err += d.toString('utf8'); });
+      child.on('error', reject);
+      child.on('close', code => {
+        if (code !== 0) return reject(new Error(err || `exit ${code}`));
+        const lines = out.trim().split(/\r?\n/).filter(Boolean);
+        resolve(JSON.parse(lines[lines.length - 1]));
+      });
+    });
+
+    // 2a. 第 1 次在父进程返回 PID 9001，第 2 次在真实 Worker 持锁内返回 PID 9002 -> 必须拦截且不改文件
+    const workerChangedOut = await runParentScript('change_pid');
+    const traces1 = fs.readFileSync(traceLogPath, 'utf8').trim().split(/\r?\n/).map(l => JSON.parse(l));
+    assert.equal(traces1.length, 2, '真实 Worker 流程必须执行 2 次实例查询（父进程 1 次 + Worker 锁内 1 次）');
+    assert.equal(traces1[0].callerPid, workerChangedOut.parentPid, '第 1 次查询发生在父进程');
+    assert.equal(traces1[0].lockHeld, false);
+    assert.notEqual(traces1[1].callerPid, workerChangedOut.parentPid, '第 2 次查询必须发生在独立的真实 Worker 子进程 PID 中');
+    assert.equal(traces1[1].lockHeld, true, 'Worker 内的第 2 次实例复核必须在持有目标目录锁状态下执行');
+    assert.equal(workerChangedOut.res.ok, false);
+    assert.equal(workerChangedOut.res.code, 'LIVE_INSTANCE_CHANGED_OR_UNRESOLVED');
+    assert.equal(sha256(fs.readFileSync(workerTargetPath)), origSha);
+
+    // 2b. 实例身份在父进程与真实 Worker 锁内保持一致 (stable) -> 成功写入 512K
+    fs.unlinkSync(traceLogPath);
+    const workerStableOut = await runParentScript('stable');
+    const traces2 = fs.readFileSync(traceLogPath, 'utf8').trim().split(/\r?\n/).map(l => JSON.parse(l));
+    assert.equal(traces2.length, 2);
+    assert.notEqual(traces2[1].callerPid, workerStableOut.parentPid);
+    assert.equal(traces2[1].lockHeld, true);
+    assert.equal(workerStableOut.res.ok, true);
+    assert.equal(workerStableOut.res.committed, true);
+    assert.equal(workerStableOut.res.runtimeMode, 'live');
+    assert.equal(sha256(fs.readFileSync(workerTargetPath)), sha512);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('[P1 & P2] 提交后写 manifest 失败返回 committed: true 与 manifestSyncError（含直接替换、热重命名、真实 Worker），且下次写入绝不丢失旧 .old 记录', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-postcommit-old-'));
+  const stateDir = path.join(tmpDir, 'state');
+  try {
+    const targetPath = path.join(tmpDir, 'language_server.exe');
+    const orig = createPeFixture();
+    const origSha = sha256(orig);
+    fs.writeFileSync(targetPath, orig);
+    const { txPath, manifestPath } = unlock.getTargetArtifactPaths(targetPath, { _testStateDir: stateDir });
+
+    let blockManifestWrite = true;
+    const lockedOldFiles = new Set();
+    const mockFs = Object.create(fs);
+    mockFs.openSync = function (p, flags, ...rest) {
+      if (blockManifestWrite && String(p).includes('unlock-manifest-') && String(flags).includes('w')) {
+        const err = new Error('simulated EACCES writing manifest');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return fs.openSync(p, flags, ...rest);
+    };
+    mockFs.unlinkSync = function (p) {
+      if (lockedOldFiles.has(String(p))) {
+        const err = new Error('locked running .old image');
+        err.code = 'EPERM';
+        throw err;
+      }
+      return fs.unlinkSync(p);
+    };
+
+    // 1. direct_replace 分支：写 manifest 抛 EACCES，绝不抛出未捕获异常，必须返回 committed: true 与 manifestSyncError
+    const rDirect = await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '512k',
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(rDirect.ok, false);
+    assert.equal(rDirect.partialSuccess, true);
+    assert.equal(rDirect.committed, true);
+    assert.equal(rDirect.manifestSynced, false);
+    assert.equal(rDirect.code, 'POST_COMMIT_MANIFEST_SYNC_FAILED');
+    assert.equal(rDirect.manifestSyncError.code, 'EACCES');
+    assert.equal(fs.existsSync(manifestPath), false);
+    assert.equal(JSON.parse(fs.readFileSync(txPath, 'utf8')).status, 'COMMITTED');
+
+    // 先重置回 256K 以测试更关键的 hot_rename + 下次写入继承 retiredOldFiles 场景
+    fs.writeFileSync(targetPath, orig);
+    fs.unlinkSync(txPath);
+
+    // 2. hot_rename 分支（第一次写入 256K -> 512K）：留下被占用的 .old.1，且写 manifest 抛 EACCES
+    let firstOldPath = null;
+    const rHot1 = await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '512k',
+      _testStateDir: stateDir,
+      _forceHotRename: true,
+      fs: mockFs,
+      _onAfterOldMoved: async ({ oldPath }) => {
+        firstOldPath = oldPath;
+        lockedOldFiles.add(String(oldPath));
+      }
+    });
+    assert.equal(rHot1.ok, false);
+    assert.equal(rHot1.partialSuccess, true);
+    assert.equal(rHot1.committed, true);
+    assert.equal(rHot1.method, 'hot_rename');
+    assert.equal(rHot1.manifestSyncError.code, 'EACCES');
+    assert.ok(firstOldPath && fs.existsSync(firstOldPath));
+    assert.equal(fs.existsSync(manifestPath), false);
+
+    // 验证只读 getUnlockStatus 即使在 manifest 未落盘时也能从已提交事务识别待清理的 .old 文件数
+    const stMid = await unlock.getUnlockStatus({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(stMid.ok, true);
+    assert.equal(stMid.diskState.mode, '512k');
+    assert.equal(stMid.cleanupState.committedOldFiles, 1);
+    assert.equal(stMid.manifestSyncPending, true);
+
+    // 3. [P2] 第二次写入 (512K -> 1M)：此时恢复 manifest 写入权限，但 firstOldPath 仍被进程占用锁定！
+    // 验证新事务覆盖 txPath 后，firstOldPath 绝不丢失（同时保留在 manifest 与新 tx.pendingManifest 中）！
+    blockManifestWrite = false;
+    const rSecond = await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '1m',
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(rSecond.ok, true);
+    assert.equal(rSecond.committed, true);
+    assert.equal(fs.existsSync(firstOldPath), true, '仍被锁定的旧 .old 文件在磁盘上存在');
+    assert.equal(rSecond.cleanupState.committedOldFiles, 1, '第二次写入后仍必须登记 1 个待清理 .old 文件');
+
+    const savedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const savedTx = JSON.parse(fs.readFileSync(txPath, 'utf8'));
+    assert.equal(savedManifest.retiredOldFiles.some(e => e.oldPath === firstOldPath), true, 'manifest 必须保留第一次热重命名留下的 .old 记录');
+    assert.equal(savedTx.pendingManifest.retiredOldFiles.some(e => e.oldPath === firstOldPath), true, '新事务日志也必须保留第一次热重命名留下的 .old 记录');
+
+    // 4. 解除对 firstOldPath 的进程占用，执行第三次操作 (restoreUnlock -> 256K)：验证 firstOldPath 被自动按哈希核对并删除！
+    lockedOldFiles.clear();
+    const rRestore = await unlock.restoreUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(rRestore.ok, true);
+    assert.equal(fs.existsSync(firstOldPath), false, '解除占用后下次写入应成功清理已登记的旧 .old 文件');
+    assert.equal(rRestore.cleanupState.committedOldFiles, 0);
+    assert.equal(sha256(fs.readFileSync(targetPath)), origSha);
+
+    // 5. 真实 Worker 子进程模式下的提交后 manifest 写入失败测试（将 manifestPath 预置为非空目录以触发真实文件系统重命名失败）
+    fs.rmSync(manifestPath, { recursive: true, force: true });
+    fs.mkdirSync(manifestPath, { recursive: true });
+    fs.writeFileSync(path.join(manifestPath, 'blocker.txt'), 'keep');
+
+    const rWorkerPostFail = await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '512k',
+      _testStateDir: stateDir
+    });
+    assert.equal(rWorkerPostFail.ok, false);
+    assert.equal(rWorkerPostFail.partialSuccess, true);
+    assert.equal(rWorkerPostFail.committed, true, '真实 Worker 子进程也必须保留 committed: true');
+    assert.equal(rWorkerPostFail.code, 'POST_COMMIT_MANIFEST_SYNC_FAILED');
+    assert.ok(rWorkerPostFail.manifestSyncError);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('[P2] 锁协议 ENOENT 分支：旧锁释放后紧接着新进程合法取得锁，重读 owner.json 后返回 LOCKED_BY_OTHER_PROCESS 而非误报损坏', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-enoent-reread-'));
+  const stateDir = path.join(tmpDir, 'state');
+  try {
+    const targetPath = path.join(tmpDir, 'language_server.exe');
+    fs.writeFileSync(targetPath, createPeFixture());
+    const { targetId, lockDir } = unlock.getTargetArtifactPaths(targetPath, { _testStateDir: stateDir });
+    const ownerPath = path.join(lockDir, 'owner.json');
+
+    // 场景 A：旧锁在第一次读 owner.json 时释放抛 ENOENT，紧接着新存活进程写入合法 owner.json
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      pid: process.pid,
+      token: 'new-live-holder-token',
+      targetId,
+      targetPath,
+      createdAt: Date.now()
+    }));
+
+    let ownerReadCount = 0;
+    const raceFsLive = Object.create(fs);
+    raceFsLive.readFileSync = function (p, ...args) {
+      if (path.resolve(String(p)) === path.resolve(ownerPath)) {
+        ownerReadCount++;
+        if (ownerReadCount === 1) {
+          const err = new Error('ENOENT: old lock disappeared right during first read');
+          err.code = 'ENOENT';
+          throw err;
+        }
+      }
+      return fs.readFileSync(p, ...args);
+    };
+
+    const resLiveContender = await unlock.withUnlockLock(targetPath, async () => ({ ok: true }), {
+      _testStateDir: stateDir,
+      fs: raceFsLive
+    });
+    assert.equal(ownerReadCount, 2, 'ENOENT 且目录仍存在时必须执行第 2 次 owner.json 重读');
+    assert.equal(resLiveContender.ok, false);
+    assert.equal(resLiveContender.code, 'LOCKED_BY_OTHER_PROCESS', '新锁 owner 合法且存活时绝不能误报 CORRUPTED_LOCK_FILE');
+    assert.equal(fs.existsSync(lockDir), true, '不得破坏新持有者的锁目录');
+
+    // 场景 B：同样时序下新取得锁的进程已经退出 (ESRCH)，重读后应保留自身 prepDir 并正常走陈旧锁门禁回收成功！
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      pid: 99999992,
+      token: 'new-dead-holder-token',
+      targetId,
+      targetPath,
+      createdAt: Date.now() - 5000
+    }));
+
+    let deadOwnerReads = 0;
+    const raceFsDead = Object.create(fs);
+    raceFsDead.readFileSync = function (p, ...args) {
+      if (path.resolve(String(p)) === path.resolve(ownerPath)) {
+        deadOwnerReads++;
+        if (deadOwnerReads === 1) {
+          const err = new Error('ENOENT: transient release');
+          err.code = 'ENOENT';
+          throw err;
+        }
+      }
+      return fs.readFileSync(p, ...args);
+    };
+
+    const resReclaimed = await unlock.withUnlockLock(targetPath, async () => ({ ok: true, reclaimedAfterReread: true }), {
+      _testStateDir: stateDir,
+      fs: raceFsDead
+    });
+    assert.equal(resReclaimed.ok, true);
+    assert.equal(resReclaimed.reclaimedAfterReread, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('[P2] 恢复流程终态日志写入隔离：oldPath / bakPath / target_intact_before / target_reached_after 写事务日志失败均保留 committed: true、partialSuccess 与 txSyncError', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-recover-txsync-'));
+  const stateDir = path.join(tmpDir, 'state');
+  try {
+    const targetPath = path.join(tmpDir, 'language_server.exe');
+    const orig = createPeFixture();
+    const origSha = sha256(orig);
+    fs.writeFileSync(targetPath, orig);
+    const { txPath, manifestPath } = unlock.getTargetArtifactPaths(targetPath, { _testStateDir: stateDir });
+
+    let blockTxWrite = false;
+    const mockFs = Object.create(fs);
+    mockFs.openSync = function (p, flags, ...rest) {
+      if (blockTxWrite && String(p).includes('unlock-tx-') && String(flags).includes('w')) {
+        const err = new Error('simulated EACCES writing unlock-tx');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return fs.openSync(p, flags, ...rest);
+    };
+
+    // 1. 分支 A1 (oldPath -> RECOVERED) 写终态事务日志抛 EACCES
+    await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '512k',
+      _testStateDir: stateDir,
+      _forceHotRename: true,
+      inProcess: true,
+      _onAfterOldMoved: async () => {
+        throw new Error('simulated crash at OLD_MOVED');
+      }
+    }).catch(() => {});
+    assert.equal(fs.existsSync(targetPath), false);
+
+    blockTxWrite = true;
+    const recOldFail = await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(recOldFail.ok, false);
+    assert.equal(recOldFail.partialSuccess, true);
+    assert.equal(recOldFail.recovered, true);
+    assert.equal(recOldFail.recoveredFrom, 'oldPath');
+    assert.equal(recOldFail.committed, true);
+    assert.equal(recOldFail.txSynced, false);
+    assert.equal(recOldFail.code, 'POST_RECOVERY_TX_LOG_SYNC_FAILED');
+    assert.equal(recOldFail.txSyncError.code, 'EACCES');
+    assert.equal(fs.existsSync(targetPath), true, '文件本身已从 .old 恢复落盘');
+    assert.equal(sha256(fs.readFileSync(targetPath)), origSha);
+
+    // 2. 分支 B1 (target_intact_before -> RECOVERED)：此时 targetPath 已回到 beforeSha256，但 txPath 仍为 OLD_MOVED 且继续不可写
+    const recIntactFail = await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(recIntactFail.ok, false);
+    assert.equal(recIntactFail.partialSuccess, true);
+    assert.equal(recIntactFail.recovered, true);
+    assert.equal(recIntactFail.recoveredFrom, 'target_intact_before');
+    assert.equal(recIntactFail.committed, true);
+    assert.equal(recIntactFail.txSyncError.code, 'EACCES');
+
+    // 解除阻塞后再次调用 recoverUnlockTransaction 即可顺利将事务同步为 RECOVERED
+    blockTxWrite = false;
+    const recIntactOk = await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(recIntactOk.ok, true);
+    assert.equal(recIntactOk.txSynced, true);
+    assert.equal(JSON.parse(fs.readFileSync(txPath, 'utf8')).status, 'RECOVERED');
+
+    // 3. 分支 A2 (bakPath -> RECOVERED) 写终态事务日志抛 EACCES
+    await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '512k',
+      _testStateDir: stateDir,
+      _forceHotRename: true,
+      inProcess: true,
+      _onAfterOldMoved: async ({ oldPath }) => {
+        fs.unlinkSync(oldPath);
+        throw new Error('simulated crash with missing oldPath');
+      }
+    }).catch(() => {});
+    assert.equal(fs.existsSync(targetPath), false);
+
+    blockTxWrite = true;
+    const recBakFail = await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(recBakFail.ok, false);
+    assert.equal(recBakFail.partialSuccess, true);
+    assert.equal(recBakFail.recovered, true);
+    assert.equal(recBakFail.recoveredFrom, 'bakPath');
+    assert.equal(recBakFail.committed, true);
+    assert.equal(recBakFail.txSynced, false);
+    assert.equal(recBakFail.txSyncError.code, 'EACCES');
+    assert.equal(sha256(fs.readFileSync(targetPath)), origSha);
+
+    blockTxWrite = false;
+    await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+
+    // 4. 分支 B2 (target_reached_after -> COMMITTED) 补记 COMMITTED 抛 EACCES
+    await unlock.applyUnlock({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      mode: '512k',
+      _testStateDir: stateDir,
+      _forceHotRename: true,
+      inProcess: true,
+      _onAfterOldMoved: async ({ stagedPath, oldPath }) => {
+        // 模拟 stagedPath 已移入 targetPath（到达 afterSha256），但在更新 txPath 为 COMMITTED 前进程崩溃
+        fs.renameSync(stagedPath, targetPath);
+        fs.unlinkSync(oldPath);
+        throw new Error('simulated crash right after staged moved to target');
+      }
+    }).catch(() => {});
+
+    blockTxWrite = true;
+    const recAfterFail = await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(recAfterFail.ok, false);
+    assert.equal(recAfterFail.partialSuccess, true);
+    assert.equal(recAfterFail.recovered, true);
+    assert.equal(recAfterFail.recoveredFrom, 'target_reached_after');
+    assert.equal(recAfterFail.committed, true);
+    assert.equal(recAfterFail.txSynced, false);
+    assert.equal(recAfterFail.manifestSynced, false);
+    assert.equal(recAfterFail.code, 'POST_RECOVERY_TX_LOG_SYNC_FAILED');
+    assert.equal(recAfterFail.txSyncError.code, 'EACCES');
+
+    // 解除阻塞后再次恢复，同时完成 COMMITTED 日志与 manifest 补同步
+    blockTxWrite = false;
+    if (fs.existsSync(manifestPath)) fs.unlinkSync(manifestPath);
+    const recAfterOk = await unlock.recoverUnlockTransaction({
+      runtimeMode: 'cli',
+      binaryPath: targetPath,
+      _testStateDir: stateDir,
+      fs: mockFs
+    });
+    assert.equal(recAfterOk.ok, true);
+    assert.equal(recAfterOk.recoveredFrom, 'target_reached_after');
+    assert.equal(recAfterOk.txSynced, true);
+    assert.equal(recAfterOk.manifestSynced, true);
+    assert.equal(JSON.parse(fs.readFileSync(txPath, 'utf8')).status, 'COMMITTED');
+    assert.equal(fs.existsSync(manifestPath), true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

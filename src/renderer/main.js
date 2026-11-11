@@ -1476,9 +1476,9 @@
         ? Number(customIn.value)
         : unlockCustomK;
       unlockCustomK = kVal;
-      return { tier: 'custom', customK: kVal };
+      return { mode: 'custom', customK: kVal };
     }
-    return { tier: selectedUnlockTier };
+    return { mode: selectedUnlockTier };
   }
 
   function setUnlockFeedback(message, tone = 'info') {
@@ -1513,7 +1513,7 @@
       return;
     }
 
-    if (res.supported === false) {
+    if (res.unsupportedPlatform === true || res.code === 'UNSUPPORTED_PLATFORM' || res.supported === false) {
       if (headerPill) { headerPill.textContent = '仅支持 Win x64'; headerPill.className = 'key-pill pill-muted'; }
       if (diskStatusEl) diskStatusEl.textContent = res.error || '当前平台不支持本地二进制补丁（仅支持 Windows x64）';
       if (backupStatusEl) backupStatusEl.textContent = '不适用';
@@ -1530,14 +1530,32 @@
       targetPathEl.textContent = res.targetPath || '—';
     }
 
-    if (!res.ok) {
+    const bak = res.backupState || null;
+    const disk = res.diskState || null;
+
+    if (!res.ok || !disk) {
       const isNoBridge = res.code === 'NO_BRIDGE';
       if (headerPill) {
-        headerPill.textContent = res.needsRecovery ? '⚠ 事务待恢复' : (isNoBridge ? '未连接' : '状态异常');
-        headerPill.className = res.needsRecovery ? 'key-pill pill-warn' : (isNoBridge ? 'key-pill pill-muted' : 'key-pill pill-danger');
+        if (res.needsRecovery) {
+          headerPill.textContent = '⚠ 事务待恢复';
+          headerPill.className = 'key-pill pill-warn';
+        } else if (isNoBridge) {
+          headerPill.textContent = '未连接';
+          headerPill.className = 'key-pill pill-muted';
+        } else if (res.status === 'target_missing') {
+          headerPill.textContent = '未找到文件';
+          headerPill.className = 'key-pill pill-danger';
+        } else {
+          headerPill.textContent = '状态异常';
+          headerPill.className = 'key-pill pill-danger';
+        }
       }
       if (diskStatusEl) diskStatusEl.textContent = res.error || res.code || '读取状态失败';
-      if (backupStatusEl) backupStatusEl.textContent = res.backup?.valid ? '✔ 同构建备份有效' : (res.backup?.exists ? '已存在备份文件' : '—');
+      if (backupStatusEl) {
+        backupStatusEl.textContent = bak?.validSameBuild
+          ? '✔ 同构建备份有效'
+          : ((bak?.exists || res.bakExists) ? '已检测到同目录 .bak 备份文件' : '—');
+      }
       if (runtimeStatusEl) runtimeStatusEl.textContent = '—';
       if (btnDryRun) btnDryRun.disabled = true;
       if (btnApply) btnApply.disabled = true;
@@ -1549,23 +1567,29 @@
       return;
     }
 
-    // res.ok === true
+    // res.ok === true && res.diskState 存在
+    const overall = disk.overallState;
+    const tierLabel = disk.label || disk.mode || overall;
+
     if (headerPill) {
       if (res.needsRecovery) {
         headerPill.textContent = '⚠ 事务待恢复';
         headerPill.className = 'key-pill pill-warn';
-      } else if (res.runtimeState === 'pending_restart') {
-        headerPill.textContent = `⏳ 待重启 (${res.tierLabel || res.tierKey || '已修改'})`;
+      } else if (overall === 'UNVERIFIED_PATCHED') {
+        headerPill.textContent = `只读: ${tierLabel || '外部补丁'}`;
         headerPill.className = 'key-pill pill-warn';
-      } else if (res.overallState === 'ORIGINAL_256K') {
+      } else if (overall === 'MIXED_PATCHED') {
+        headerPill.textContent = `混合状态: ${tierLabel}`;
+        headerPill.className = 'key-pill pill-warn';
+      } else if (res.runtimeState === 'pending_restart') {
+        headerPill.textContent = `⏳ 待重启 (${tierLabel || '已修改'})`;
+        headerPill.className = 'key-pill pill-warn';
+      } else if (overall === 'ORIGINAL_256K') {
         headerPill.textContent = '磁盘: 256K 默认';
         headerPill.className = 'key-pill pill-muted';
-      } else if (res.overallState === 'PATCHED_VERIFIED') {
-        headerPill.textContent = `磁盘: ${res.tierLabel || res.tierKey}`;
+      } else if (overall === 'PATCHED') {
+        headerPill.textContent = `磁盘: ${tierLabel}`;
         headerPill.className = 'key-pill pill-good';
-      } else if (res.overallState === 'PATCHED_UNVERIFIED_READONLY') {
-        headerPill.textContent = `只读: ${res.tierLabel || '外部补丁'}`;
-        headerPill.className = 'key-pill pill-warn';
       } else {
         headerPill.textContent = '状态异常';
         headerPill.className = 'key-pill pill-danger';
@@ -1573,18 +1597,24 @@
     }
 
     if (diskStatusEl) {
-      const g3a = res.gate3A?.state || '—';
-      const g3b = res.gate3B?.state || '—';
-      diskStatusEl.textContent = `${res.tierLabel || res.overallState || '未知'} (Gate 3A: ${g3a}, Gate 3B: ${g3b})`;
+      const g3a = disk.gate3a?.label || disk.gate3a?.mode || '—';
+      const g3b = disk.gate3b?.state || '—';
+      let diskText = `${tierLabel || '未知'} (Gate 3A: ${g3a}, Gate 3B: ${g3b})`;
+      if (res.needsRecovery && res.activeTransaction) {
+        diskText += ` · 检测到未完成事务 (${res.activeTransaction.status})，请先点击恢复`;
+      }
+      diskStatusEl.textContent = diskText;
     }
 
     if (backupStatusEl) {
-      if (res.backup?.valid) {
+      if (bak?.validSameBuild) {
         backupStatusEl.textContent = '✔ 已验证同构建原版 .bak（支持任意档位切换与 100% 原版还原）';
-      } else if (res.overallState === 'ORIGINAL_256K') {
-        backupStatusEl.textContent = '尚未创建（首次应用补丁时将在锁内自动建立同构建 .bak）';
-      } else if (res.backup?.exists) {
-        backupStatusEl.textContent = `✖ 备份校验未通过 (${res.backup.reason || '非同构建版本'})，已禁止写入与还原`;
+      } else if (overall === 'ORIGINAL_256K') {
+        backupStatusEl.textContent = bak?.exists
+          ? '当前为 256K 原版（旧版本 .bak 将在首次应用补丁时自动归档并刷新）'
+          : '尚未创建（首次应用补丁时将在锁内自动建立同构建 .bak）';
+      } else if (bak?.exists) {
+        backupStatusEl.textContent = `✖ 备份校验未通过 (${bak.reason || '非同构建版本'})，已禁止写入与还原`;
       } else {
         backupStatusEl.textContent = '⚠ 缺失同构建 .bak（外部补丁无法确认 Gate 3B 原始长度，当前仅只读展示）';
       }
@@ -1600,11 +1630,10 @@
       runtimeStatusEl.textContent = rtText;
     }
 
-    if (!userPickedUnlockTier && res.tierKey) {
-      const mapped = res.tierKey === 'original_256k' ? '256k' : res.tierKey;
-      if (['256k', '512k', '1m', 'unlimited', 'custom'].includes(mapped)) {
-        const customKFromCap = (mapped === 'custom' && res.capTokens) ? Math.round(res.capTokens / 1024) : undefined;
-        selectUnlockTier(mapped, customKFromCap);
+    if (!userPickedUnlockTier && disk.mode) {
+      if (['256k', '512k', '1m', 'unlimited', 'custom'].includes(disk.mode)) {
+        const customKFromCap = (disk.mode === 'custom' && disk.capTokens) ? Math.round(disk.capTokens / 1000) : undefined;
+        selectUnlockTier(disk.mode, customKFromCap);
       }
     }
 
@@ -1612,9 +1641,26 @@
     if (btnApply) btnApply.disabled = unlockBusy || !res.canWrite;
     if (btnRestore) btnRestore.disabled = unlockBusy || !res.canRestore;
     if (btnRecover) {
-      btnRecover.style.display = res.needsRecovery ? 'inline-block' : 'none';
+      btnRecover.style.display = (res.needsRecovery || res.manifestSyncPending) ? 'inline-block' : 'none';
       btnRecover.disabled = unlockBusy;
     }
+  }
+
+  function formatPostCommitWarnings(res) {
+    const parts = [];
+    if (res?.txSyncError) {
+      parts.push(`事务记录待同步 (${res.txSyncError.code || res.txSyncError.error || 'TX_LOG_WRITE_FAILED'})`);
+    }
+    if (res?.manifestSyncError) {
+      parts.push(`同步状态清单失败 (${res.manifestSyncError.code || res.manifestSyncError.error || 'MANIFEST_SYNC_FAILED'})，下次写入或恢复时将自动补齐`);
+    }
+    if (!parts.length && res && !res.ok && res.error) {
+      parts.push(res.error);
+    }
+    if (res?.lockReleaseError) {
+      parts.push(`释放锁目录失败 (${res.lockReleaseError.error || res.lockReleaseError.code})`);
+    }
+    return parts.join('；');
   }
 
   async function refreshUnlockStatus() {
@@ -1629,18 +1675,19 @@
     unlockBusy = true;
     renderUnlockStatus(lastUnlockStatus);
     try {
-      const target = buildCurrentTargetSpec();
-      const res = await callUnlockApi('dry-run', { target });
+      const specPayload = buildCurrentTargetSpec();
+      const res = await callUnlockApi('dry-run', specPayload);
       lastUnlockActionResult = res;
       if (res?.ok) {
         if (lastUnlockStatus && res.beforeSha256) {
-          lastUnlockStatus.currentSha256 = res.beforeSha256;
+          if (lastUnlockStatus.diskState) lastUnlockStatus.diskState.sha256 = res.beforeSha256;
+          lastUnlockStatus.beforeSha256 = res.beforeSha256;
           if (res.instanceIdentity) lastUnlockStatus.instanceIdentity = res.instanceIdentity;
         }
-        const g3aHex = res.gate3A?.patchVA != null ? `0x${Number(res.gate3A.patchVA).toString(16)}` : '—';
-        const g3bHex = res.gate3B?.patchVA != null ? `0x${Number(res.gate3B.patchVA).toString(16)}` : '—';
-        const changeTxt = res.willChange ? '将写入新机器码并自动维护同构建 .bak' : '当前磁盘文件已处于该档位（无需重复写入）';
-        setUnlockFeedback(`✔ 预检通过：目标档位 [${res.targetSpec?.label || target.tier}] · Gate 3A (${g3aHex}) · Gate 3B (${g3bHex}, ${res.gate3B?.patchLength || '?'}B) · ${changeTxt}`, 'ok');
+        const g3aHex = res.gate3a?.va != null ? `0x${Number(res.gate3a.va).toString(16)}` : '—';
+        const g3bHex = res.gate3b?.va != null ? `0x${Number(res.gate3b.va).toString(16)}` : '—';
+        const changeTxt = res.changed ? '将写入新机器码并自动维护同构建 .bak' : '当前磁盘文件已处于该档位（无需重复写入）';
+        setUnlockFeedback(`✔ 预检通过：目标档位 [${res.targetSpec?.label || specPayload.mode}] · Gate 3A (${g3aHex}) · Gate 3B (${g3bHex}, ${res.gate3b?.patchLen ?? '?'}B) · ${changeTxt}`, 'ok');
       } else {
         setUnlockFeedback(`✖ 预检未通过 (${res?.code || 'ERROR'})：${res?.error || '未知原因'}`, 'error');
       }
@@ -1656,20 +1703,28 @@
     unlockBusy = true;
     renderUnlockStatus(lastUnlockStatus);
     try {
-      const target = buildCurrentTargetSpec();
+      const specPayload = buildCurrentTargetSpec();
+      const expectedBeforeSha256 = lastUnlockStatus?.diskState?.sha256 || lastUnlockStatus?.beforeSha256 || undefined;
       const res = await callUnlockApi('apply', {
-        target,
-        expectedBeforeSha256: lastUnlockStatus?.currentSha256 || undefined,
+        ...specPayload,
+        expectedBeforeSha256,
         expectedInstanceIdentity: lastUnlockStatus?.instanceIdentity || undefined
       });
       lastUnlockActionResult = res;
       await refreshUnlockStatus();
-      if (res?.ok) {
+      const appliedLabel = res?.appliedSpec?.label || res?.targetSpec?.label || specPayload.mode;
+      const stratLabel = res?.method === 'hot_rename' ? 'NTFS 热重命名替换（运行中进程免关闭写入）' : '直接替换';
+      const postWarn = res?.committed ? formatPostCommitWarnings(res) : '';
+      if (res?.committed && (postWarn || !res?.ok)) {
+        setUnlockFeedback(
+          `⚠ 部分成功：档位 [${appliedLabel}] 已写入磁盘并提交（方式：${stratLabel}），但提交后元数据存在异常：${postWarn || '未知元数据异常'}。请完全退出并重启 Antigravity 客户端生效！`,
+          'warn'
+        );
+      } else if (res?.ok) {
         if (res.changed === false) {
-          setUnlockFeedback(`ℹ 当前磁盘二进制已处于所选档位 (${res.targetSpec?.label || target.tier})，无需重复写入。`, 'info');
+          setUnlockFeedback(`ℹ 当前磁盘二进制已处于所选档位 (${appliedLabel})，无需重复写入。`, 'info');
         } else {
-          const stratLabel = res.strategy === 'hot_rename' ? 'NTFS 热重命名替换（运行中进程免关闭写入）' : '直接替换';
-          setUnlockFeedback(`✅ 已成功应用档位 [${res.targetSpec?.label || target.tier}]（方式：${stratLabel}）。请完全退出并重启 Antigravity 客户端以使新压缩上限生效！`, 'ok');
+          setUnlockFeedback(`✅ 已成功应用档位 [${appliedLabel}]（方式：${stratLabel}）。请完全退出并重启 Antigravity 客户端以使新压缩上限生效！`, 'ok');
         }
       } else {
         setUnlockFeedback(`✖ 应用补丁失败 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
@@ -1686,10 +1741,22 @@
     unlockBusy = true;
     renderUnlockStatus(lastUnlockStatus);
     try {
-      const res = await callUnlockApi('restore', {});
+      const expectedBeforeSha256 = lastUnlockStatus?.diskState?.sha256 || lastUnlockStatus?.beforeSha256 || undefined;
+      const res = await callUnlockApi('restore', {
+        expectedBeforeSha256,
+        expectedInstanceIdentity: lastUnlockStatus?.instanceIdentity || undefined
+      });
       lastUnlockActionResult = res;
       await refreshUnlockStatus();
-      if (res?.ok) {
+      const postWarn = res?.committed ? formatPostCommitWarnings(res) : '';
+      if (res?.committed && (postWarn || !res?.ok)) {
+        userPickedUnlockTier = false;
+        selectUnlockTier('256k');
+        setUnlockFeedback(
+          `⚠ 部分成功：已从同构建 .bak 还原为官方 256K 原版，但提交后元数据存在异常：${postWarn || '未知元数据异常'}。请完全退出并重启 Antigravity 客户端后生效。`,
+          'warn'
+        );
+      } else if (res?.ok) {
         userPickedUnlockTier = false;
         selectUnlockTier('256k');
         setUnlockFeedback('✅ 已从同构建 .bak 完整还原为官方 256K 原版！请完全退出并重启 Antigravity 客户端后生效。', 'ok');
@@ -1708,10 +1775,22 @@
     unlockBusy = true;
     renderUnlockStatus(lastUnlockStatus);
     try {
-      const res = await callUnlockApi('recover', {});
+      const res = await callUnlockApi('recover', {
+        expectedInstanceIdentity: lastUnlockStatus?.instanceIdentity || undefined
+      });
       lastUnlockActionResult = res;
       await refreshUnlockStatus();
-      if (res?.ok) {
+      const postWarn = res?.committed ? formatPostCommitWarnings(res) : '';
+      if (res?.committed && res?.txSyncError) {
+        const txDetail = res.txSyncError.code || res.txSyncError.error || 'TX_LOG_WRITE_FAILED';
+        const lockExtra = res.lockReleaseError ? `；释放锁目录失败 (${res.lockReleaseError.error || res.lockReleaseError.code})` : '';
+        setUnlockFeedback(
+          `⚠ 部分成功：文件已恢复，事务记录待同步 (${txDetail}${lockExtra})；请恢复状态目录写入权限后再次点击恢复以同步记录。`,
+          'warn'
+        );
+      } else if (res?.committed && (postWarn || !res?.ok)) {
+        setUnlockFeedback(`⚠ 部分成功：文件与事务已恢复，但元数据存在异常：${postWarn || '未知元数据异常'}`, 'warn');
+      } else if (res?.ok) {
         setUnlockFeedback(`✅ 事务恢复完成${res.noop ? '（无需额外恢复动作）' : ''}！`, 'ok');
       } else {
         setUnlockFeedback(`✖ 事务恢复未完成 (${res?.code || 'ERROR'})：${res?.error || '未知错误'}`, 'error');
@@ -2810,7 +2889,7 @@
   }
 
   function openGithubRepo(pathSuffix = '') {
-    const url = 'https://github.com/elviscjn-cjn/antigravity-context-viewer' + pathSuffix;
+    const url = 'https://github.com/MoiraToki/antigravity-context-viewer' + pathSuffix;
     if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.openExternal === 'function') {
       window.contextMeterAPI.openExternal(url);
     } else {
