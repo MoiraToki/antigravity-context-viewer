@@ -2296,7 +2296,10 @@
     route: null, count: 0, latest: null, requestAt: 0, requestError: '',
     requestBusy: false, requestNext: 0, scanBusy: false, scanNext: 0,
     scanError: '', scan: null, generation: 0, controllers: new Set(),
-    disposed: false, layoutMode: 'wide', tooltipOpen: false
+    disposed: false, layoutMode: 'wide', tooltipOpen: false,
+    callsHydrated: false, syncedFinalMap: new Map(), pendingFinalCalls: new Map(),
+    quarantinedOversizeMap: new Map(), flushFinalsBusy: false, pendingFlushForceSync: false,
+    nextFlushRetryAt: 0, nextOversizeRetryAt: 0
   };
   const route = () => location.pathname.match(/^\/c\/([a-f\d-]{36})(?:\/|$)/i)?.[1] || null;
   let activeHeatView = 'daily';
@@ -3792,7 +3795,7 @@
       bTokens.setAttribute('aria-expanded', 'true');
       syncHostStackingElevation(true);
       positionFloatingPanels();
-      void syncTokenHistoryFromHost();
+      void syncTokenHistoryFromHost(true);
       renderActiveHeatView(true);
     } else if (target === 'context') {
       hideContextTooltip();
@@ -7079,13 +7082,14 @@ function closeAllDropdowns(exceptWrap = null) {
 
 
   async function recordModelCallsRemote(calls) {
-    if (!calls || !calls.length) return;
+    if (!calls || !calls.length) return { ok: false, changed: false };
     try {
       if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.recordCalls === 'function') {
         const res = await window.contextMeterAPI.recordCalls(calls);
         if (res && res.ok === false) {
           console.warn('Context Meter: 记录调用入账失败', res.error);
         }
+        return res || { ok: false, changed: false };
       } else if (typeof window !== 'undefined' && window.__AGContextMeterLive?.port) {
         const live = window.__AGContextMeterLive;
         const resp = await fetch(`http://127.0.0.1:${live.port}/record-calls`, {
@@ -7094,17 +7098,29 @@ function closeAllDropdowns(exceptWrap = null) {
           body: JSON.stringify({ calls })
         });
         if (!resp.ok) {
+          const errBody = typeof resp.json === 'function' ? await resp.json().catch(() => null) : null;
           console.warn(`Context Meter: 实时通道 record-calls 响应异常 HTTP ${resp.status}`);
+          return {
+            ok: false,
+            changed: false,
+            status: resp.status,
+            ...(errBody?.error ? { error: errBody.error } : {}),
+            ...(errBody?.phase ? { phase: errBody.phase } : {}),
+            ...(errBody?.code ? { code: errBody.code } : {})
+          };
         } else {
           const res = await resp.json().catch(() => null);
           if (res && res.ok === false) {
             console.warn('Context Meter: 实时通道 record-calls 失败', res.error);
           }
+          return res || { ok: false, changed: false, status: resp.status };
         }
       }
     } catch (err) {
       console.warn('Context Meter: 调用入账发生异常', err);
+      return { ok: false, changed: false, error: err?.message || String(err || '') };
     }
+    return { ok: false, changed: false };
   }
 
   async function restoreSettingsFromHost() {
@@ -7172,20 +7188,32 @@ function closeAllDropdowns(exceptWrap = null) {
     } catch {}
   }
 
+  let lastHistorySync = 0;
   let historySyncBusy = false;
-  async function syncTokenHistoryFromHost() {
-    if (historySyncBusy || state.disposed) return;
+  let historySyncPending = false;
+  let historySyncPendingForce = false;
+  let hasScheduledInitialUpdateCheck = false;
+  async function syncTokenHistoryFromHost(force = false) {
+    if (state.disposed) return;
+    if (historySyncBusy) {
+      historySyncPending = true;
+      if (force) historySyncPendingForce = true;
+      return;
+    }
+    const forceFlag = Boolean(force);
     historySyncBusy = true;
+    lastHistorySync = Date.now();
     try {
       await restoreSettingsFromHost();
+      if (state.disposed) return;
       if (typeof window !== 'undefined' && window.__AGContextMeterHistory) {
         if (!ANTIGRAVITY_TOKEN_DATA.updatedAt && !ANTIGRAVITY_TOKEN_DATA.summary?.grandTotalTokens) {
           applyTokenHistoryPayload(window.__AGContextMeterHistory);
         }
       }
       if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.getTokenHistory === 'function') {
-        const res = await window.contextMeterAPI.getTokenHistory(false);
-        if (res?.ok && res.data) {
+        const res = await window.contextMeterAPI.getTokenHistory(forceFlag);
+        if (!state.disposed && res?.ok && res.data) {
           if (typeof window !== 'undefined') window.__AGContextMeterHistory = res.data;
           applyTokenHistoryPayload(res.data);
         }
@@ -7194,9 +7222,9 @@ function closeAllDropdowns(exceptWrap = null) {
         const r = await fetch(`http://127.0.0.1:${live.port}/token-history`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-AG-Context-Token': live.token },
-          body: JSON.stringify({ force: false })
+          body: JSON.stringify({ force: forceFlag })
         });
-        if (r.ok) {
+        if (!state.disposed && r.ok) {
           const j = await r.json();
           if (j?.ok && j.data) {
             if (typeof window !== 'undefined') window.__AGContextMeterHistory = j.data;
@@ -7207,8 +7235,16 @@ function closeAllDropdowns(exceptWrap = null) {
     } catch {}
     finally {
       historySyncBusy = false;
-      if (autoCheckUpdate) {
-        setTimeout(() => { void checkAppUpdate(false); }, 1200);
+      lastHistorySync = Date.now();
+      if (!hasScheduledInitialUpdateCheck && autoCheckUpdate && !state.disposed) {
+        hasScheduledInitialUpdateCheck = true;
+        setTimeout(() => { if (!state.disposed) void checkAppUpdate(false); }, 1200);
+      }
+      if (historySyncPending && !state.disposed) {
+        const nextForce = historySyncPendingForce;
+        historySyncPending = false;
+        historySyncPendingForce = false;
+        void syncTokenHistoryFromHost(nextForce);
       }
     }
   }
@@ -8477,6 +8513,283 @@ function renderHeatmapGrid(forceRebuild = false) {
     el('refresh').disabled = state.scanBusy;
   }
 
+  const MAX_FLUSH_BATCH_CALLS = 500;
+  const MAX_FLUSH_BATCH_BYTES = 900 * 1024;
+  const MAX_LIVE_RECORD_BODY_BYTES = 1024 * 1024;
+  const utf8Encoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+
+  function getUtf8ByteLength(str) {
+    const s = String(str ?? '');
+    if (utf8Encoder) return utf8Encoder.encode(s).length;
+    if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') return Buffer.byteLength(s, 'utf8');
+    let bytes = 0;
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code < 0x80) bytes += 1;
+      else if (code < 0x800) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
+        const next = s.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; i++; }
+        else bytes += 3;
+      } else bytes += 3;
+    }
+    return bytes;
+  }
+
+  const getSingleCallBodyBytes = call => 12 + getUtf8ByteLength(JSON.stringify(call));
+
+  const getModelRank = (model, modelKey) => {
+    const s = String(model || '').trim();
+    if (!s) return 0;
+    if (/^model_placeholder_/i.test(s)) return modelKey ? 2 : 1;
+    return modelKey ? 3 : 2;
+  };
+
+  const getDateRank = call => {
+    if (!call) return 0;
+    const hasDate = Boolean(call.date && /^\d{4}-\d{2}-\d{2}/.test(String(call.date)));
+    const isProv = call.dateIsProvisional === true || call.dateSource === 'provisional';
+    if (isProv) return hasDate ? 1 : 0;
+    if (call.dateSource === 'transcript' && (hasDate || call.created_at)) return 4;
+    if (call.created_at) return 3;
+    if (hasDate) return 2;
+    return 0;
+  };
+
+  const getFinalCallWatermark = call => ({
+    tot: (call?.inputTokens || 0) + (call?.cacheTokens || 0) + (call?.outputTokens || 0),
+    out: call?.outputTokens || 0,
+    model: String(call?.model || '').trim(),
+    modelKey: String(call?.modelKey || '').trim(),
+    isPriced: Boolean(call?.isPriced),
+    costUSD: Number(call?.costUSD || 0),
+    date: call?.date ? String(call.date).slice(0, 10) : '',
+    dateRank: getDateRank(call)
+  });
+
+  function hasWatermarkProgressed(nextWm, prevWm) {
+    if (!prevWm) return true;
+    if (nextWm.tot > prevWm.tot || nextWm.out > prevWm.out) return true;
+    if (getModelRank(nextWm.model, nextWm.modelKey) > getModelRank(prevWm.model, prevWm.modelKey)) return true;
+    if (!prevWm.modelKey && Boolean(nextWm.modelKey)) return true;
+    if (!prevWm.isPriced && Boolean(nextWm.isPriced)) return true;
+    if ((nextWm.dateRank || 0) > (prevWm.dateRank || 0)) return true;
+    if ((nextWm.dateRank || 0) >= 2 && (nextWm.dateRank || 0) === (prevWm.dateRank || 0) && Boolean(nextWm.date) && nextWm.date !== prevWm.date) return true;
+    if (nextWm.isPriced && nextWm.costUSD > (prevWm.costUSD || 0) + 1e-12) return true;
+    return false;
+  }
+
+  function mergeWatermarks(prevWm, nextWm) {
+    if (!prevWm) return { ...nextWm };
+    const nextRank = getModelRank(nextWm.model, nextWm.modelKey);
+    const prevRank = getModelRank(prevWm.model, prevWm.modelKey);
+    const nextDateRank = nextWm.dateRank || 0;
+    const prevDateRank = prevWm.dateRank || 0;
+    const takeNextDate = nextDateRank > prevDateRank
+      || (nextDateRank >= 2 && nextDateRank === prevDateRank && Boolean(nextWm.date))
+      || (nextDateRank === prevDateRank && Boolean(nextWm.date) && (!prevWm.date || nextWm.date < prevWm.date));
+    const nextChangedDateTier = takeNextDate && Boolean(nextWm.date) && nextWm.date !== prevWm.date;
+    let mergedCost = Math.max(prevWm.isPriced ? (prevWm.costUSD || 0) : 0, nextWm.isPriced ? (nextWm.costUSD || 0) : 0);
+    if (nextChangedDateTier && nextWm.isPriced && nextWm.tot >= prevWm.tot && nextWm.out >= prevWm.out) {
+      mergedCost = nextWm.costUSD || 0;
+    }
+    return {
+      tot: Math.max(prevWm.tot, nextWm.tot),
+      out: Math.max(prevWm.out, nextWm.out),
+      model: nextRank >= prevRank && nextWm.model ? nextWm.model : prevWm.model,
+      modelKey: nextWm.modelKey || prevWm.modelKey || '',
+      isPriced: Boolean(prevWm.isPriced || nextWm.isPriced),
+      costUSD: mergedCost,
+      date: takeNextDate ? nextWm.date : (prevWm.date || nextWm.date || ''),
+      dateRank: Math.max(prevDateRank, nextDateRank)
+    };
+  }
+
+  function mergePendingCallData(prevCall, nextCall) {
+    if (!prevCall) return nextCall;
+    const prevWm = getFinalCallWatermark(prevCall);
+    const nextWm = getFinalCallWatermark(nextCall);
+    const merged = { ...nextCall };
+    const takePrevUsage = prevWm.tot > nextWm.tot || (prevWm.tot === nextWm.tot && prevWm.out > nextWm.out);
+    if (takePrevUsage) {
+      merged.inputTokens = prevCall.inputTokens;
+      merged.cacheTokens = prevCall.cacheTokens;
+      merged.cacheReadTokens = prevCall.cacheReadTokens;
+      merged.outputTokens = prevCall.outputTokens;
+      merged.thinkingTokens = prevCall.thinkingTokens;
+      merged.responseTokens = prevCall.responseTokens;
+      merged.totalTokens = prevCall.totalTokens;
+    }
+    const prevDateRank = prevWm.dateRank || 0;
+    const nextDateRank = nextWm.dateRank || 0;
+    const takePrevDate = prevDateRank > nextDateRank
+      || (prevDateRank === nextDateRank && prevDateRank < 2 && Boolean(prevWm.date) && (!nextWm.date || prevWm.date < nextWm.date));
+    if (takePrevDate) {
+      merged.date = prevCall.date;
+      merged.created_at = prevCall.created_at;
+      if (prevCall.dateSource !== undefined) merged.dateSource = prevCall.dateSource;
+      else delete merged.dateSource;
+      merged.dateIsProvisional = prevCall.dateIsProvisional;
+    }
+    if (getModelRank(prevWm.model, prevWm.modelKey) > getModelRank(nextWm.model, nextWm.modelKey)) {
+      merged.model = prevCall.model;
+    }
+    if (!nextWm.modelKey && prevWm.modelKey) {
+      merged.modelKey = prevCall.modelKey;
+    }
+    if (typeof calculateRequestApiCost === 'function' && (merged.model || merged.modelKey)) {
+      const recalc = calculateRequestApiCost(merged);
+      if (recalc.isPriced) {
+        merged.modelKey = recalc.modelKey;
+        merged.isPriced = true;
+        merged.costUSD = recalc.costUSD ?? 0;
+      }
+    } else if (!nextWm.isPriced && prevWm.isPriced) {
+      merged.isPriced = prevCall.isPriced;
+      merged.costUSD = prevCall.costUSD;
+    } else if (nextWm.isPriced && prevWm.isPriced && (takePrevUsage || takePrevDate) && (prevWm.costUSD || 0) > (nextWm.costUSD || 0)) {
+      merged.costUSD = prevCall.costUSD;
+    }
+    return merged;
+  }
+
+  function takeNextPendingBatch(pendingMap) {
+    const chunk = [];
+    const snap = [];
+    let totalBytes = 12; // '{"calls":[]}'
+    for (const call of pendingMap.values()) {
+      if (chunk.length >= MAX_FLUSH_BATCH_CALLS) break;
+      const itemBytes = getUtf8ByteLength(JSON.stringify(call));
+      if (12 + itemBytes > MAX_FLUSH_BATCH_BYTES) continue;
+      const addedBytes = (chunk.length > 0 ? 1 : 0) + itemBytes;
+      if (chunk.length > 0 && totalBytes + addedBytes > MAX_FLUSH_BATCH_BYTES) break;
+      chunk.push(call);
+      snap.push({ callId: call.callId, wm: getFinalCallWatermark(call) });
+      totalBytes += addedBytes;
+    }
+    return { chunk, snap };
+  }
+
+  function commitConfirmedEntries(entries) {
+    for (const entry of entries) {
+      state.quarantinedOversizeMap?.delete(entry.callId);
+      const curSynced = state.syncedFinalMap.get(entry.callId);
+      state.syncedFinalMap.set(entry.callId, mergeWatermarks(curSynced, entry.wm));
+      const curPending = state.pendingFinalCalls.get(entry.callId);
+      if (curPending && !hasWatermarkProgressed(getFinalCallWatermark(curPending), entry.wm)) {
+        state.pendingFinalCalls.delete(entry.callId);
+      }
+    }
+  }
+
+  const EXPLICIT_OVERSIZE_RE = /\b413\b|payload\s+too\s+large|entity\s+too\s+large|body\s+too\s+large|(?:payload|body|size|record|message|batch|bytes?)\b.*(?:exceeds?|exceeded|over)\b|(?:exceeds?|exceeded|over)\b.*(?:\d+\s*(?:kib|mib|kb|mb|bytes?)|(?:size|payload|body)\s*(?:limit|max))|传输体积超限|体积超限|超出上限|超过.*上限/i;
+
+  function isExplicitOversizeError(recRes) {
+    if (!recRes || typeof recRes !== 'object') return false;
+    if (recRes.status === 413) return true;
+    if (recRes.code === 'PAYLOAD_TOO_LARGE' || recRes.code === 'OVERSIZE' || recRes.phase === 'oversize_guard') return true;
+    return EXPLICIT_OVERSIZE_RE.test(String(recRes.error || ''));
+  }
+
+  function quarantineOversizedEntry(callId, wm) {
+    if (!state.quarantinedOversizeMap) state.quarantinedOversizeMap = new Map();
+    const prevQuarantined = state.quarantinedOversizeMap.get(callId);
+    state.quarantinedOversizeMap.set(callId, mergeWatermarks(prevQuarantined, wm));
+    const curPending = state.pendingFinalCalls.get(callId);
+    if (curPending && !hasWatermarkProgressed(getFinalCallWatermark(curPending), wm) && getSingleCallBodyBytes(curPending) > MAX_FLUSH_BATCH_BYTES) {
+      state.pendingFinalCalls.delete(callId);
+    }
+  }
+
+  async function flushPendingFinalCalls(triggerSyncEvenIfUnchanged) {
+    if (triggerSyncEvenIfUnchanged && state.flushFinalsBusy) {
+      state.pendingFlushForceSync = true;
+    }
+    if (state.flushFinalsBusy || state.disposed || !state.pendingFinalCalls?.size) return;
+    if (Date.now() < (state.nextFlushRetryAt || 0)) return;
+    state.flushFinalsBusy = true;
+    let anySucceeded = false;
+    let anyChanged = false;
+    let failedDuringLoop = false;
+    try {
+      while (!state.disposed && state.pendingFinalCalls.size > 0) {
+        if (Date.now() < (state.nextFlushRetryAt || 0)) break;
+        const { chunk, snap } = takeNextPendingBatch(state.pendingFinalCalls);
+        if (!chunk.length) break;
+        const recRes = await recordModelCallsRemote(chunk);
+        if (state.disposed) break;
+        if (recRes?.ok === true) {
+          anySucceeded = true;
+          if (recRes.changed) anyChanged = true;
+          commitConfirmedEntries(snap);
+        } else {
+          failedDuringLoop = true;
+          state.nextFlushRetryAt = Date.now() + (document.hidden ? 15000 : 3000);
+          break;
+        }
+      }
+      if (!state.disposed && !failedDuringLoop && state.pendingFinalCalls.size > 0 && Date.now() >= (state.nextOversizeRetryAt || 0)) {
+        const oversizedItems = [];
+        for (const call of state.pendingFinalCalls.values()) {
+          const singleBytes = getSingleCallBodyBytes(call);
+          if (singleBytes > MAX_FLUSH_BATCH_BYTES) {
+            oversizedItems.push({ call, singleBytes, wm: getFinalCallWatermark(call) });
+          }
+        }
+        for (const item of oversizedItems) {
+          if (state.disposed) break;
+          if (!state.pendingFinalCalls.has(item.call.callId)) continue;
+          const isLiveHttpMode = !(typeof window !== 'undefined' && typeof window.contextMeterAPI?.recordCalls === 'function')
+            && Boolean(typeof window !== 'undefined' && window.__AGContextMeterLive?.port);
+          if (isLiveHttpMode && item.singleBytes > MAX_LIVE_RECORD_BODY_BYTES) {
+            quarantineOversizedEntry(item.call.callId, item.wm);
+            console.warn(`Context Meter: 单条调用记录超过实时通道 1MiB 上限 (${item.singleBytes} bytes)，已隔离跳过: ${item.call.callId}`);
+            continue;
+          }
+          const recRes = await recordModelCallsRemote([item.call]);
+          if (state.disposed) break;
+          if (recRes?.ok === true) {
+            anySucceeded = true;
+            if (recRes.changed) anyChanged = true;
+            state.nextOversizeRetryAt = 0;
+            commitConfirmedEntries([{ callId: item.call.callId, wm: item.wm }]);
+          } else if ((isLiveHttpMode && (item.singleBytes > MAX_LIVE_RECORD_BODY_BYTES || recRes?.status === 413)) || isExplicitOversizeError(recRes)) {
+            quarantineOversizedEntry(item.call.callId, item.wm);
+            console.warn(`Context Meter: 超大调用记录入账被拒绝，已隔离跳过: ${item.call.callId}`);
+          } else {
+            failedDuringLoop = true;
+            const retryAt = Date.now() + (document.hidden ? 15000 : 3000);
+            state.nextOversizeRetryAt = retryAt;
+            state.nextFlushRetryAt = retryAt;
+            break;
+          }
+        }
+      }
+      if (!state.disposed && !failedDuringLoop && state.pendingFinalCalls.size > 0 && (state.nextOversizeRetryAt || 0) > Date.now()) {
+        const { chunk: remainingNormal } = takeNextPendingBatch(state.pendingFinalCalls);
+        if (!remainingNormal.length) {
+          state.nextFlushRetryAt = state.nextOversizeRetryAt;
+        }
+      }
+      if (!state.disposed && anySucceeded) {
+        if (!failedDuringLoop && state.pendingFinalCalls.size === 0) {
+          state.nextFlushRetryAt = 0;
+          state.nextOversizeRetryAt = 0;
+        }
+        if (triggerSyncEvenIfUnchanged || state.pendingFlushForceSync || anyChanged) {
+          state.pendingFlushForceSync = false;
+          lastHistorySync = Date.now();
+          void syncTokenHistoryFromHost(true);
+        }
+      }
+    } finally {
+      state.flushFinalsBusy = false;
+      if (anySucceeded && !state.disposed && state.pendingFinalCalls.size > 0 && Date.now() >= (state.nextFlushRetryAt || 0)) {
+        void flushPendingFinalCalls(true);
+      }
+    }
+  }
+
   async function requestPoll(generation, id) {
     state.requestBusy = true;
     const controller = new AbortController(); state.controllers.add(controller);
@@ -8490,18 +8803,60 @@ function renderHeatmapGrid(forceRebuild = false) {
       const rows = data.generatorMetadata || [];
       state.count = rows.length ? offset + rows.length : 0;
       if (!state.sessionCallsMap) state.sessionCallsMap = new Map();
-      const parsedCalls = [];
+      if (!state.syncedFinalMap) state.syncedFinalMap = new Map();
+      if (!state.pendingFinalCalls) state.pendingFinalCalls = new Map();
+      if (!state.quarantinedOversizeMap) state.quarantinedOversizeMap = new Map();
+      const wasHydrated = Boolean(state.callsHydrated);
+      let hasNewOrProgressedPending = false;
       for (let i = 0; i < rows.length; i++) {
         const call = parseGeneratorCall ? parseGeneratorCall(rows[i], id, 'desktop') : null;
         if (call && call.callId) {
-          state.sessionCallsMap.set(call.callId, call);
-          parsedCalls.push(call);
+          const prevSessionCall = state.sessionCallsMap.get(call.callId);
+          const mergedSessionCall = (prevSessionCall && call.status === 'final' && prevSessionCall.status === 'final')
+            ? mergePendingCallData(prevSessionCall, call)
+            : call;
+          state.sessionCallsMap.set(call.callId, mergedSessionCall);
+          if (call.status === 'final') {
+            const wm = getFinalCallWatermark(call);
+            const prevSynced = state.syncedFinalMap.get(call.callId);
+            if (hasWatermarkProgressed(wm, prevSynced)) {
+              const prevQuarantined = state.quarantinedOversizeMap.get(call.callId);
+              if (prevQuarantined && !hasWatermarkProgressed(wm, prevQuarantined) && getSingleCallBodyBytes(call) > MAX_FLUSH_BATCH_BYTES) {
+                continue;
+              }
+              const prevPending = state.pendingFinalCalls.get(call.callId);
+              const prevPendingWm = prevPending ? getFinalCallWatermark(prevPending) : null;
+              const progressedVsPending = hasWatermarkProgressed(wm, prevPendingWm);
+              if (progressedVsPending) {
+                hasNewOrProgressedPending = true;
+                if (getSingleCallBodyBytes(call) > MAX_FLUSH_BATCH_BYTES) {
+                  state.nextOversizeRetryAt = 0;
+                }
+              }
+              const notRegressedVsPending = !prevPendingWm || (
+                wm.tot >= prevPendingWm.tot &&
+                wm.out >= prevPendingWm.out &&
+                getModelRank(wm.model, wm.modelKey) >= getModelRank(prevPendingWm.model, prevPendingWm.modelKey) &&
+                (wm.dateRank || 0) >= (prevPendingWm.dateRank || 0) &&
+                (!prevPendingWm.modelKey || Boolean(wm.modelKey)) &&
+                (!prevPendingWm.isPriced || Boolean(wm.isPriced))
+              );
+              if (progressedVsPending || notRegressedVsPending) {
+                const nextPendingCall = prevPending ? mergePendingCallData(prevPending, call) : call;
+                state.pendingFinalCalls.set(call.callId, nextPendingCall);
+              }
+            }
+          }
         }
       }
+      state.callsHydrated = true;
       state.sessionCalls = Array.from(state.sessionCallsMap.values());
       state.sessionCostTotal = state.sessionCalls.reduce((sum, c) => sum + (c.isPriced ? (c.costUSD || 0) : 0), 0);
-      if (parsedCalls.length) {
-        void recordModelCallsRemote(parsedCalls.filter(c => c.status === 'final'));
+      if (hasNewOrProgressedPending) {
+        state.nextFlushRetryAt = 0;
+      }
+      if (state.pendingFinalCalls.size > 0) {
+        void flushPendingFinalCalls(wasHydrated);
       }
       for (let i = rows.length - 1; i >= 0; i--) { const value = summarize(rows[i]); if (value) { state.latest = withStepError(value, rows[i]); break; } }
       state.requestAt = Date.now(); state.requestError = '';
@@ -8530,7 +8885,6 @@ function renderHeatmapGrid(forceRebuild = false) {
     finally { if (generation === state.generation && !state.disposed) { state.scanBusy = false; state.scanNext = Date.now() + (document.hidden ? 60000 : 20000); render(); } }
   }
 
-  let lastHistorySync = 0;
   function tick() {
     if (!state.disposed && !host.isConnected) {
       ensureHostDocked();
@@ -8539,11 +8893,12 @@ function renderHeatmapGrid(forceRebuild = false) {
     if (id !== state.route) {
       for (const controller of state.controllers) controller.abort(); state.controllers.clear(); state.generation++;
       if (state.sessionCallsMap) state.sessionCallsMap.clear();
-      Object.assign(state, { route: id, count: 0, latest: null, sessionCalls: [], sessionCostTotal: 0, requestAt: 0, requestError: '', requestBusy: false, requestNext: 0, scanBusy: false, scanNext: 0, scanError: '', scan: null }); toggle(false); hideContextTooltip(); renderFiles(null); render();
+      Object.assign(state, { route: id, count: 0, latest: null, sessionCalls: [], sessionCostTotal: 0, callsHydrated: false, requestAt: 0, requestError: '', requestBusy: false, requestNext: 0, scanBusy: false, scanNext: 0, scanError: '', scan: null }); toggle(false); hideContextTooltip(); renderFiles(null); render();
       void syncTokenHistoryFromHost(true);
     }
     if (id && !state.requestBusy && Date.now() >= state.requestNext) void requestPoll(state.generation, id);
     if (id && !state.scanBusy && Date.now() >= state.scanNext) void scan(state.generation, id);
+    if (!state.disposed && state.pendingFinalCalls?.size && !state.flushFinalsBusy && Date.now() >= (state.nextFlushRetryAt || 0)) void flushPendingFinalCalls(true);
     if (Date.now() - lastHistorySync > 15000) {
       lastHistorySync = Date.now();
       void syncTokenHistoryFromHost(false);
@@ -8598,6 +8953,7 @@ function renderHeatmapGrid(forceRebuild = false) {
     setCountry: val => applyDirectCountrySelection(val),
     setCurrency: val => applyDirectCurrencySelection(val),
     restoreSettingsFromHost,
+    syncTokenHistoryFromHost,
     launchCli: opts => triggerLaunchCli(opts),
     getLastCliLaunchResult: () => lastCliLaunchResult,
     refreshUnlockStatus: () => refreshUnlockStatus(),
