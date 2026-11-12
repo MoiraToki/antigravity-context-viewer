@@ -127,7 +127,26 @@ function safeReadJsonSync(targetPath, fallbackValue = null, options = {}) {
   }
 
   const resolved = path.resolve(targetPath);
-  if (!fsImpl.existsSync(resolved)) {
+  if (typeof fsImpl.statSync === 'function') {
+    try {
+      const st = fsImpl.statSync(resolved);
+      if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+        return { ok: false, data: fallbackValue, exists: true, corrupted: false, code: 'EISDIR', error: '目标路径是一个目录，无法作为文件读取' };
+      }
+    } catch (statErr) {
+      if (statErr && statErr.code === 'ENOENT') {
+        return { ok: true, data: fallbackValue, exists: false, corrupted: false };
+      }
+      return {
+        ok: false,
+        data: fallbackValue,
+        exists: true,
+        corrupted: false,
+        code: statErr?.code,
+        error: statErr?.message || '检查目标文件状态失败'
+      };
+    }
+  } else if (!fsImpl.existsSync(resolved)) {
     return { ok: true, data: fallbackValue, exists: false, corrupted: false };
   }
 
@@ -135,7 +154,7 @@ function safeReadJsonSync(targetPath, fallbackValue = null, options = {}) {
   try {
     content = fsImpl.readFileSync(resolved, 'utf8');
   } catch (err) {
-    return { ok: false, data: fallbackValue, exists: true, corrupted: false, error: err?.message || '读取文件失败' };
+    return { ok: false, data: fallbackValue, exists: true, corrupted: false, code: err?.code, error: err?.message || '读取文件失败' };
   }
 
   if (!content.trim()) {
