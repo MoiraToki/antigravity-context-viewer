@@ -1704,7 +1704,7 @@ test('unlock drawer UI controls end-to-end with real meter-unlock module, read-o
   }
 });
 
-test('real-time token history refresh: idle 3s requestPoll dedup, strict recordCalls -> getTokenHistory(true) ordering, and busy coalescing', async () => {
+test('real-time token history refresh: idle dedup, recordCalls ordering, a 5s automatic scan interval, and busy coalescing', async () => {
   const h = harness();
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
@@ -1856,10 +1856,20 @@ test('real-time token history refresh: idle 3s requestPoll dedup, strict recordC
     h.tick();
     h.pending[5].resolve({ ok: true, json: async () => ({ generatorMetadata: [idleRow, calibratedRow2] }) });
     await flushAsync();
+    assert.deepEqual(events, ['recordCalls:resp-live-2'], 'Ledger writes should proceed during the scan cooldown');
+
+    fakeNow += 1499;
+    h.tick();
+    await flushAsync();
+    assert.deepEqual(events, ['recordCalls:resp-live-2'], 'No automatic scan before five seconds');
+
+    fakeNow += 1;
+    h.tick();
+    await flushAsync();
     assert.deepEqual(events, ['recordCalls:resp-live-2', 'getTokenHistory:true']);
 
     events.length = 0;
-    fakeNow += 3500;
+    fakeNow += 2000;
     h.tick();
     h.pending[6].resolve({ ok: true, json: async () => ({ generatorMetadata: [idleRow, calibratedRow2] }) });
     await flushAsync();
@@ -2416,6 +2426,10 @@ test('pendingFinalCalls survives route switches across conversations and / home 
     resolveMidFlight({ ok: true, changed: true });
     await flushAsync();
     assert.equal(savedLedger.has('resp-route-u2'), true);
+    assert.deepEqual(events, []);
+    fakeNow += 5000;
+    h.tick();
+    await flushAsync();
     assert.deepEqual(events, ['getTokenHistory:true']);
 
     // Re-entering /c/22222222-... and polling rowUuid2 again must NOT re-send resp-route-u2 (syncedFinalMap preserved across routes)
@@ -2545,6 +2559,10 @@ test('flushPendingFinalCalls chunks >500 items and >900KB UTF-8 payloads for liv
     await flushAsync();
 
     assert.equal(savedIds.size, 501, 'Remaining Chunk 2 item must succeed on retry and drain queue to 0');
+    assert.deepEqual(chunkLog, ['chunk:1:c_501..c_501']);
+    fakeNow += 1500;
+    h.tick();
+    await flushAsync();
     assert.deepEqual(chunkLog, [
       'chunk:1:c_501..c_501',
       'history:true'
@@ -2552,7 +2570,7 @@ test('flushPendingFinalCalls chunks >500 items and >900KB UTF-8 payloads for liv
 
     // Idle poll makes 0 /record-calls requests
     chunkLog.length = 0;
-    fakeNow += 3500;
+    fakeNow += 2000;
     h.tick();
     const poll3Idx = h.pending.length - 1;
     h.pending[poll3Idx].resolve({ ok: true, json: async () => ({ generatorMetadata: rows501.slice(498) }) });
@@ -2707,7 +2725,7 @@ test('final call model enrichment with unchanged 100 tokens re-sends to host onc
     assert.equal(savedLedger.get('resp-ph-mapped')?.isPriced, false);
 
     events.length = 0;
-    fakeNow += 3500;
+    fakeNow += 5000;
     h.tick();
     h.pending[h.pending.length - 1].resolve({
       ok: true,
@@ -3067,7 +3085,7 @@ test('oversized >1 MiB first item never head-of-line blocks normal queued items 
     fakeNow += 3500;
     h.tick();
     await flushAsync();
-    assert.deepEqual(ipcEvents, []);
+    assert.deepEqual(ipcEvents, ['ipcHistory:true'], 'The deferred history refresh runs without re-sending either oversized record');
   } finally {
     console.warn = origWarn;
     api.dispose();
@@ -3214,7 +3232,7 @@ test('[P2] renderer watermark re-sends when RPC upgrades provisional date to aut
     ]);
 
     events.length = 0;
-    fakeNow += 3500;
+    fakeNow += 5000;
     const rowCarbonAuthNov = {
       ...rowCarbonProvDec,
       created_at: '2026-11-25T10:00:00Z'
@@ -3372,7 +3390,7 @@ test('[P3] provisional Carbon call crossing 11-30 -> 12-01 rate-hike midnight do
 
     // 5) 随后 RPC 补齐真实本地 2026-12-01 时间戳：日期来源升阶 (1 -> 3)，按 12-01 费率 ($1.51) 校准落盘，后续轮询零重发
     events.length = 0;
-    fakeNow += 3500;
+    fakeNow += 5000;
     const rowCarbonAuthDec = {
       ...rowCarbonProgressedUsage,
       created_at: new realDate(2026, 11, 1, 0, 0, 1).toISOString()

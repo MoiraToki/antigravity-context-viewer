@@ -7192,7 +7192,19 @@ function closeAllDropdowns(exceptWrap = null) {
   let historySyncBusy = false;
   let historySyncPending = false;
   let historySyncPendingForce = false;
+  const AUTOMATIC_HISTORY_SYNC_INTERVAL_MS = 5000;
+  let automaticHistorySyncPending = false;
+  let lastAutomaticHistorySync = null;
   let hasScheduledInitialUpdateCheck = false;
+
+  function syncPendingAutomaticHistory() {
+    if (!automaticHistorySyncPending || historySyncBusy || state.disposed) return;
+    const now = Date.now();
+    if (lastAutomaticHistorySync !== null && now - lastAutomaticHistorySync < AUTOMATIC_HISTORY_SYNC_INTERVAL_MS) return;
+    lastAutomaticHistorySync = now;
+    void syncTokenHistoryFromHost(true);
+  }
+
   async function syncTokenHistoryFromHost(force = false) {
     if (state.disposed) return;
     if (historySyncBusy) {
@@ -7201,6 +7213,7 @@ function closeAllDropdowns(exceptWrap = null) {
       return;
     }
     const forceFlag = Boolean(force);
+    if (forceFlag) automaticHistorySyncPending = false;
     historySyncBusy = true;
     lastHistorySync = Date.now();
     try {
@@ -7245,6 +7258,8 @@ function closeAllDropdowns(exceptWrap = null) {
         historySyncPending = false;
         historySyncPendingForce = false;
         void syncTokenHistoryFromHost(nextForce);
+      } else {
+        syncPendingAutomaticHistory();
       }
     }
   }
@@ -8784,8 +8799,8 @@ function renderHeatmapGrid(forceRebuild = false) {
         }
         if (triggerSyncEvenIfUnchanged || state.pendingFlushForceSync || anyChanged) {
           state.pendingFlushForceSync = false;
-          lastHistorySync = Date.now();
-          void syncTokenHistoryFromHost(true);
+          automaticHistorySyncPending = true;
+          syncPendingAutomaticHistory();
         }
       }
     } finally {
@@ -8926,6 +8941,7 @@ function renderHeatmapGrid(forceRebuild = false) {
     if (id && !state.requestBusy && Date.now() >= state.requestNext) void requestPoll(state.generation, id);
     if (id && !state.scanBusy && Date.now() >= state.scanNext) void scan(state.generation, id);
     if (!state.disposed && state.pendingFinalCalls?.size && !state.flushFinalsBusy && Date.now() >= (state.nextFlushRetryAt || 0)) void flushPendingFinalCalls(true);
+    syncPendingAutomaticHistory();
     if (Date.now() - lastHistorySync > 15000) {
       lastHistorySync = Date.now();
       void syncTokenHistoryFromHost(false);
