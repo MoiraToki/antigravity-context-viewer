@@ -2826,18 +2826,25 @@
         return;
       }
 
+      if (settingsRes?.ok) {
+        const savedView = settingsRes.savedHeatView || settingsRes.uiPreferences?.savedHeatView;
+        if (savedView && ['daily', 'weekly', 'monthly', 'yearly', 'cum'].includes(savedView)) {
+          switchHeatView(savedView, false);
+        }
+        const savedAutoUpdate = settingsRes.autoCheckUpdate !== undefined
+          ? settingsRes.autoCheckUpdate
+          : settingsRes.uiPreferences?.autoCheckUpdate;
+        if (savedAutoUpdate !== undefined) {
+          autoCheckUpdate = savedAutoUpdate !== false;
+          const chk = el('check-auto-update');
+          if (chk) chk.checked = autoCheckUpdate;
+        }
+      }
+
       if (settingsRes?.ok && settingsRes.customPlan && typeof settingsRes.customPlan === 'object') {
         lastSavedCustomPlan = { ...settingsRes.customPlan };
         if (typeof window !== 'undefined') {
           window.__AGContextMeterSettings = { ok: true, customPlan: { ...settingsRes.customPlan } };
-        }
-        if (settingsRes.savedHeatView && ['daily', 'weekly', 'monthly', 'yearly', 'cum'].includes(settingsRes.savedHeatView)) {
-          switchHeatView(settingsRes.savedHeatView, false);
-        }
-        if (settingsRes.autoCheckUpdate !== undefined) {
-          autoCheckUpdate = settingsRes.autoCheckUpdate !== false;
-          const chk = el('check-auto-update');
-          if (chk) chk.checked = autoCheckUpdate;
         }
 
         const email = ANTIGRAVITY_TOKEN_DATA.planStatus?.email || settingsRes.customPlan?.account || currentEmail || 'default';
