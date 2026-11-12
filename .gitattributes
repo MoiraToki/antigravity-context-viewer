@@ -14,3 +14,6 @@
 *.png binary
 *.jpg binary
 *.asar binary
+
+# Generated renderer bundle: never text-merge; rebuild via npm run build:renderer
+meter-renderer.js merge=binary
