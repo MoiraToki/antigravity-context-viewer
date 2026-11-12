@@ -8573,9 +8573,15 @@ function renderHeatmapGrid(forceRebuild = false) {
     if (getModelRank(nextWm.model, nextWm.modelKey) > getModelRank(prevWm.model, prevWm.modelKey)) return true;
     if (!prevWm.modelKey && Boolean(nextWm.modelKey)) return true;
     if (!prevWm.isPriced && Boolean(nextWm.isPriced)) return true;
-    if ((nextWm.dateRank || 0) > (prevWm.dateRank || 0)) return true;
-    if ((nextWm.dateRank || 0) >= 2 && (nextWm.dateRank || 0) === (prevWm.dateRank || 0) && Boolean(nextWm.date) && nextWm.date !== prevWm.date) return true;
-    if (nextWm.isPriced && nextWm.costUSD > (prevWm.costUSD || 0) + 1e-12) return true;
+    const nextDateRank = nextWm.dateRank || 0;
+    const prevDateRank = prevWm.dateRank || 0;
+    if (nextDateRank > prevDateRank) return true;
+    if (nextDateRank >= 2 && nextDateRank === prevDateRank && Boolean(nextWm.date) && nextWm.date !== prevWm.date) return true;
+    const hasInferiorDate = Boolean(prevWm.date) && Boolean(nextWm.date) && nextWm.date !== prevWm.date && (
+      nextDateRank < prevDateRank ||
+      (nextDateRank < 2 && prevDateRank < 2 && nextWm.date > prevWm.date)
+    );
+    if (!hasInferiorDate && nextWm.isPriced && nextWm.costUSD > (prevWm.costUSD || 0) + 1e-12) return true;
     return false;
   }
 
@@ -8812,24 +8818,45 @@ function renderHeatmapGrid(forceRebuild = false) {
         const call = parseGeneratorCall ? parseGeneratorCall(rows[i], id, 'desktop') : null;
         if (call && call.callId) {
           const prevSessionCall = state.sessionCallsMap.get(call.callId);
-          const mergedSessionCall = (prevSessionCall && call.status === 'final' && prevSessionCall.status === 'final')
+          const prevSynced = state.syncedFinalMap.get(call.callId);
+          const prevPending = state.pendingFinalCalls.get(call.callId);
+          const prevQuarantined = state.quarantinedOversizeMap.get(call.callId);
+          let effectiveCall = (prevSessionCall && call.status === 'final' && prevSessionCall.status === 'final')
             ? mergePendingCallData(prevSessionCall, call)
             : call;
-          state.sessionCallsMap.set(call.callId, mergedSessionCall);
-          if (call.status === 'final') {
-            const wm = getFinalCallWatermark(call);
-            const prevSynced = state.syncedFinalMap.get(call.callId);
+          if (effectiveCall.status === 'final' && getDateRank(effectiveCall) === 1) {
+            let earliestProvDate = effectiveCall.date ? String(effectiveCall.date).slice(0, 10) : '';
+            for (const ref of [prevPending, prevSynced, prevQuarantined]) {
+              const refRank = ref ? (ref.dateRank !== undefined ? ref.dateRank : getDateRank(ref)) : 0;
+              const refDate = ref?.date ? String(ref.date).slice(0, 10) : '';
+              if (refRank === 1 && refDate && (!earliestProvDate || refDate < earliestProvDate)) {
+                earliestProvDate = refDate;
+              }
+            }
+            if (earliestProvDate && earliestProvDate !== String(effectiveCall.date || '').slice(0, 10)) {
+              effectiveCall = { ...effectiveCall, date: earliestProvDate, created_at: null, dateSource: 'provisional', dateIsProvisional: true };
+              if (typeof calculateRequestApiCost === 'function' && (effectiveCall.model || effectiveCall.modelKey)) {
+                const recalc = calculateRequestApiCost(effectiveCall);
+                if (recalc.isPriced) {
+                  effectiveCall.modelKey = recalc.modelKey;
+                  effectiveCall.isPriced = true;
+                  effectiveCall.costUSD = recalc.costUSD ?? 0;
+                }
+              }
+            }
+          }
+          state.sessionCallsMap.set(call.callId, effectiveCall);
+          if (effectiveCall.status === 'final') {
+            const wm = getFinalCallWatermark(effectiveCall);
             if (hasWatermarkProgressed(wm, prevSynced)) {
-              const prevQuarantined = state.quarantinedOversizeMap.get(call.callId);
-              if (prevQuarantined && !hasWatermarkProgressed(wm, prevQuarantined) && getSingleCallBodyBytes(call) > MAX_FLUSH_BATCH_BYTES) {
+              if (prevQuarantined && !hasWatermarkProgressed(wm, prevQuarantined) && getSingleCallBodyBytes(effectiveCall) > MAX_FLUSH_BATCH_BYTES) {
                 continue;
               }
-              const prevPending = state.pendingFinalCalls.get(call.callId);
               const prevPendingWm = prevPending ? getFinalCallWatermark(prevPending) : null;
               const progressedVsPending = hasWatermarkProgressed(wm, prevPendingWm);
               if (progressedVsPending) {
                 hasNewOrProgressedPending = true;
-                if (getSingleCallBodyBytes(call) > MAX_FLUSH_BATCH_BYTES) {
+                if (getSingleCallBodyBytes(effectiveCall) > MAX_FLUSH_BATCH_BYTES) {
                   state.nextOversizeRetryAt = 0;
                 }
               }
@@ -8842,7 +8869,7 @@ function renderHeatmapGrid(forceRebuild = false) {
                 (!prevPendingWm.isPriced || Boolean(wm.isPriced))
               );
               if (progressedVsPending || notRegressedVsPending) {
-                const nextPendingCall = prevPending ? mergePendingCallData(prevPending, call) : call;
+                const nextPendingCall = prevPending ? mergePendingCallData(prevPending, effectiveCall) : effectiveCall;
                 state.pendingFinalCalls.set(call.callId, nextPendingCall);
               }
             }

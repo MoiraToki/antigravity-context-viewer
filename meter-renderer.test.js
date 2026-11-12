@@ -3244,3 +3244,162 @@ test('[P2] renderer watermark re-sends when RPC upgrades provisional date to aut
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('[P3] provisional Carbon call crossing 11-30 -> 12-01 rate-hike midnight does not trigger spurious cost-growth re-send', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls } = require('./meter-collector');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-renderer-prov-rate-midnight-'));
+  const ledgerPath = path.join(tempDir, 'pricing_ledger_v1.json');
+  const prevWindow = globalThis.window;
+  const origDateNow = Date.now;
+
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  const flushAsync = async () => {
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  };
+
+  let fakeNow = new Date(2026, 10, 30, 23, 59, 58).getTime(); // 本地 2026-11-30 23:59:58
+  const realDate = h.sandbox.Date;
+  const MockDate = function (...args) {
+    return args.length ? new realDate(...args) : new realDate(fakeNow);
+  };
+  MockDate.now = () => fakeNow;
+  MockDate.parse = realDate.parse;
+  MockDate.UTC = realDate.UTC;
+  h.sandbox.Date = MockDate;
+
+  globalThis.window = h.sandbox.window;
+  Date.now = () => fakeNow;
+
+  h.finishScan(0);
+  await flushAsync();
+
+  const events = [];
+  h.sandbox.window.contextMeterAPI = {
+    ...h.sandbox.window.contextMeterAPI,
+    recordCalls: calls => {
+      const desc = calls.map(c => `${c.callId}:${c.date}:${c.dateSource || 'none'}:${c.costUSD}`).join(',');
+      events.push(`recordCalls:${desc}`);
+      const res = recordModelCalls(calls, { agDir: tempDir });
+      return Promise.resolve({ ok: res.ok, changed: res.changed, error: res.error, phase: res.phase });
+    },
+    getTokenHistory: force => {
+      events.push(`getTokenHistory:${Boolean(force)}`);
+      return Promise.resolve({
+        ok: true,
+        data: {
+          updatedAt: '2026-11-30 23:59:59',
+          summary: { grandTotalTokens: 360000, todayTokens: 360000 },
+          dailyMap: { '2026-11-30': { total: 360000, input: 250000, cache: 100000, output: 10000, steps: 1 } }
+        }
+      });
+    }
+  };
+
+  try {
+    // 1) 2026-11-30 23:59:58 首次观测无时间戳 Carbon 调用：按 11-30 费率 ($0.61) 记临时日期并落盘
+    const rowCarbonProv = {
+      stepIndices: [1],
+      status: 'final',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_carbon_prov_midnight' },
+        chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } }
+      }
+    };
+    h.pending[0].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowCarbonProv] }) });
+    await flushAsync();
+
+    assert.deepEqual(events, [
+      'recordCalls:resp_carbon_prov_midnight:2026-11-30:provisional:0.61',
+      'getTokenHistory:true'
+    ]);
+    assert.equal(api.snapshot().sessionCostTotal, 0.61);
+
+    // 2) 跨过 11-30 -> 12-01 调价零点（未锚定时按 12-01 会变成 $1.22）：仍为临时日期且用量未变，不得触发任何重传，面板费用保持 $0.61
+    events.length = 0;
+    fakeNow = new Date(2026, 11, 1, 0, 0, 3).getTime(); // 本地 2026-12-01 00:00:03
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowCarbonProv] }) });
+    await flushAsync();
+    assert.deepEqual(events, [], '仍为临时日期跨过 Carbon 调价零点时不得因费率上涨触发无效重传');
+    assert.equal(api.snapshot().sessionCostTotal, 0.61);
+
+    // 3) 切换会话清空 sessionCallsMap 后再切回原会话（仍在 12-01）：凭 syncedFinalMap 锚定 11-30 临时日期，依然零重传且会话费用保持 $0.61
+    h.sandbox.location.pathname = '/c/22222222-2222-2222-2222-222222222222';
+    fakeNow += 3500;
+    h.tick();
+    await flushAsync();
+
+    h.sandbox.location.pathname = '/c/11111111-1111-1111-1111-111111111111';
+    fakeNow += 3500;
+    h.tick();
+    if (h.scans.length > 0) h.finishScan(h.scans.length - 1);
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowCarbonProv] }) });
+    await flushAsync();
+    assert.deepEqual(events, [], '跨路由切回后仍不得因 12-01 调价触发无效重传');
+    assert.equal(api.snapshot().sessionCostTotal, 0.61);
+
+    // 4) 同在 12-01 仍为临时日期时，若真实用量增长（如配比变化 + 输出增至 15k）：必须按锚定的 11-30 费率 ($0.755) 重传更新，而非 12-01 费率
+    events.length = 0;
+    fakeNow += 3500;
+    const rowCarbonProgressedUsage = {
+      ...rowCarbonProv,
+      chatModel: {
+        ...rowCarbonProv.chatModel,
+        usage: { inputTokens: 300000, cacheReadTokens: 50000, outputTokens: 15000, responseId: 'resp_carbon_prov_midnight' }
+      }
+    };
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowCarbonProgressedUsage] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_carbon_prov_midnight:2026-11-30:provisional:0.755',
+      'getTokenHistory:true'
+    ]);
+    let disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_carbon_prov_midnight.date, '2026-11-30');
+    assert.equal(disk.calls.resp_carbon_prov_midnight.costUSD, 0.755);
+
+    // 5) 随后 RPC 补齐真实本地 2026-12-01 时间戳：日期来源升阶 (1 -> 3)，按 12-01 费率 ($1.51) 校准落盘，后续轮询零重发
+    events.length = 0;
+    fakeNow += 3500;
+    const rowCarbonAuthDec = {
+      ...rowCarbonProgressedUsage,
+      created_at: new realDate(2026, 11, 1, 0, 0, 1).toISOString()
+    };
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowCarbonAuthDec] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_carbon_prov_midnight:2026-12-01:created_at:1.51',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_carbon_prov_midnight.date, '2026-12-01');
+    assert.equal(disk.calls.resp_carbon_prov_midnight.dateIsProvisional, false);
+    assert.equal(disk.calls.resp_carbon_prov_midnight.costUSD, 1.51);
+
+    events.length = 0;
+    fakeNow += 3500;
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowCarbonAuthDec] }) });
+    await flushAsync();
+    assert.deepEqual(events, []);
+  } finally {
+    Date.now = origDateNow;
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    api.dispose();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
