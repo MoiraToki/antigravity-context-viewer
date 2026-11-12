@@ -2799,6 +2799,7 @@
     syncNativeOverlayTheme();
   }
 
+  let lastSyncedOverlayKey = '';
   function syncNativeOverlayTheme() {
     try {
       if (typeof window === 'undefined') return;
@@ -2807,8 +2808,11 @@
       const cs = (rootEl && typeof window.getComputedStyle === 'function') ? window.getComputedStyle(rootEl) : null;
       const bg = cs?.getPropertyValue?.('--background')?.trim() || (isLight ? '#FAFAFA' : '#131313');
       const fg = cs?.getPropertyValue?.('--foreground')?.trim() || (isLight ? '#383A42' : '#FAFAFA');
+      const overlayKey = `${bg}|${fg}|40`;
+      if (overlayKey === lastSyncedOverlayKey) return;
+      lastSyncedOverlayKey = overlayKey;
       if (typeof window.contextMeterAPI?.syncOverlay === 'function') {
-        void window.contextMeterAPI.syncOverlay({ color: bg, symbolColor: fg, heightCssPx: 40 });
+        void window.contextMeterAPI.syncOverlay({ color: bg, symbolColor: fg, height: 40, heightCssPx: 40 });
       } else if (typeof window.electronNative?.setTitleBarOverlay === 'function') {
         void window.electronNative.setTitleBarOverlay({ color: bg, symbolColor: fg });
       }
@@ -7151,18 +7155,25 @@ function closeAllDropdowns(exceptWrap = null) {
         return;
       }
 
+      if (settingsRes?.ok) {
+        const savedView = settingsRes.savedHeatView || settingsRes.uiPreferences?.savedHeatView;
+        if (savedView && ['daily', 'weekly', 'monthly', 'yearly', 'cum'].includes(savedView)) {
+          switchHeatView(savedView, false);
+        }
+        const savedAutoUpdate = settingsRes.autoCheckUpdate !== undefined
+          ? settingsRes.autoCheckUpdate
+          : settingsRes.uiPreferences?.autoCheckUpdate;
+        if (savedAutoUpdate !== undefined) {
+          autoCheckUpdate = savedAutoUpdate !== false;
+          const chk = el('check-auto-update');
+          if (chk) chk.checked = autoCheckUpdate;
+        }
+      }
+
       if (settingsRes?.ok && settingsRes.customPlan && typeof settingsRes.customPlan === 'object') {
         lastSavedCustomPlan = { ...settingsRes.customPlan };
         if (typeof window !== 'undefined') {
           window.__AGContextMeterSettings = { ok: true, customPlan: { ...settingsRes.customPlan } };
-        }
-        if (settingsRes.savedHeatView && ['daily', 'weekly', 'monthly', 'yearly', 'cum'].includes(settingsRes.savedHeatView)) {
-          switchHeatView(settingsRes.savedHeatView, false);
-        }
-        if (settingsRes.autoCheckUpdate !== undefined) {
-          autoCheckUpdate = settingsRes.autoCheckUpdate !== false;
-          const chk = el('check-auto-update');
-          if (chk) chk.checked = autoCheckUpdate;
         }
 
         const email = ANTIGRAVITY_TOKEN_DATA.planStatus?.email || settingsRes.customPlan?.account || currentEmail || 'default';
@@ -7725,9 +7736,10 @@ function renderHeatmapGrid(forceRebuild = false) {
 
     if ((viewType === 'monthly' || viewType === 'yearly') && subRatioWrapEl && subRatioEl) {
       const plan = resolveEffectivePlanStatus(ANTIGRAVITY_TOKEN_DATA.planStatus, ANTIGRAVITY_TOKEN_DATA.customPlanSettings);
-      const isZeroCost = plan.isZeroExtraCost || plan.pricePaid === 0;
-      if (!isZeroCost && plan.pricePaid > 0 && costAgg.totalCostUSD > 0) {
-        const subMonthlyUSD = plan.currency === 'USD' ? plan.pricePaid : (plan.actualPricePaidCNY ? plan.actualPricePaidCNY / 6.72 : plan.pricePaid);
+      const paidVal = plan.actualPricePaid ?? plan.pricePaid ?? plan.officialPriceMonthly ?? null;
+      const isZeroCost = plan.isZeroExtraCost || paidVal === 0;
+      if (!isZeroCost && paidVal > 0 && costAgg.totalCostUSD > 0) {
+        const subMonthlyUSD = plan.currency === 'USD' ? paidVal : (plan.actualPricePaidCNY ? plan.actualPricePaidCNY / 6.72 : paidVal);
         if (subMonthlyUSD > 0) {
           const ratio = (costAgg.totalCostUSD / (viewType === 'yearly' ? subMonthlyUSD * 12 : subMonthlyUSD)).toFixed(1);
           subRatioEl.textContent = `${ratio}x 回本`;
