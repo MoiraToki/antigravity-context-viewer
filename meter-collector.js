@@ -341,7 +341,7 @@ function getPricingLedgerPath(overridePathOrDir) {
   return path.join(home, '.gemini', 'antigravity', 'pricing_ledger_v1.json');
 }
 
-function createUnreadableLedger(filePath, error, isCorrupted = false, phase = 'unreadable_guard') {
+function createUnreadableLedger(filePath, error, isCorrupted = false, phase = 'unreadable_guard', code = undefined) {
   return {
     version: '1.0.0',
     updatedAt: '',
@@ -349,6 +349,7 @@ function createUnreadableLedger(filePath, error, isCorrupted = false, phase = 'u
     ...(isCorrupted ? { __corrupted: true } : {}),
     __unreadable: true,
     __guardPhase: phase,
+    ...(code ? { __code: code } : {}),
     __corruptedPath: filePath,
     __error: error || '账本文件当前不可读'
   };
@@ -415,12 +416,13 @@ function loadPricingLedger(overridePathOrDir, options = {}) {
     if (statErr && statErr.code === 'ENOENT') {
       return def;
     }
-    return createUnreadableLedger(p, statErr?.message || '检查账本文件状态失败', false, 'unreadable_guard');
+    return createUnreadableLedger(p, statErr?.message || '检查账本文件状态失败', false, 'unreadable_guard', statErr?.code);
   }
 
   if (!st || typeof st.isFile !== 'function' || !st.isFile()) {
     ledgerCacheByPath.delete(cacheKey);
-    return createUnreadableLedger(p, '账本目标路径不是普通文件', false, 'unreadable_guard');
+    const nonFileCode = (st && typeof st.isDirectory === 'function' && st.isDirectory()) ? 'EISDIR' : 'EINVAL';
+    return createUnreadableLedger(p, '账本目标路径不是普通文件', false, 'unreadable_guard', nonFileCode);
   }
 
   if (!options?.fs) {
@@ -440,18 +442,18 @@ function loadPricingLedger(overridePathOrDir, options = {}) {
   if (!readRes.exists) {
     ledgerCacheByPath.delete(cacheKey);
     // statSync 已确认文件存在，后续读取却返回 exists: false 时必须阻断写入，防止瞬态异常清空账本
-    return createUnreadableLedger(p, readRes.error || '账本文件状态不一致（stat 存在但读取返回不存在）', false, 'unreadable_guard');
+    return createUnreadableLedger(p, readRes.error || '账本文件状态不一致（stat 存在但读取返回不存在）', false, 'unreadable_guard', readRes.code || 'ENOENT');
   }
 
   if (readRes.corrupted && !readRes.recoveredFromBackup) {
     ledgerCacheByPath.delete(cacheKey);
     // 文件存在但损坏且无备份可恢复，绝不能当作正常空数据覆盖
-    return createUnreadableLedger(p, readRes.error, true, 'corrupted_guard');
+    return createUnreadableLedger(p, readRes.error, true, 'corrupted_guard', readRes.code);
   }
 
   if (!readRes.ok || !readRes.data || typeof readRes.data !== 'object') {
     ledgerCacheByPath.delete(cacheKey);
-    return createUnreadableLedger(p, readRes.error || '读取账本文件失败', false, 'unreadable_guard');
+    return createUnreadableLedger(p, readRes.error || '读取账本文件失败', false, 'unreadable_guard', readRes.code);
   }
 
   const raw = readRes.data;
@@ -486,13 +488,17 @@ function loadPricingLedger(overridePathOrDir, options = {}) {
     } catch {}
   }
 
-  if (readRes.ok && !options?.fs) {
+  if (readRes.ok && !hasSynthetic && !options?.fs) {
     try {
       const stAfter = fsImpl.statSync(p);
-      if (stAfter.isFile()) {
+      if (stAfter.isFile() && stAfter.mtimeMs === st.mtimeMs && stAfter.size === st.size) {
         ledgerCacheByPath.set(cacheKey, { ledger, mtimeMs: stAfter.mtimeMs, size: stAfter.size });
+      } else {
+        ledgerCacheByPath.delete(cacheKey);
       }
-    } catch {}
+    } catch {
+      ledgerCacheByPath.delete(cacheKey);
+    }
   }
   return ledger;
 }
@@ -503,7 +509,12 @@ function savePricingLedger(ledger, overridePathOrDir, options = {}) {
     const errMsg = ledger.__corrupted
       ? '原账本数据已损坏且未从备份恢复，已阻止以空数据覆盖原有历史'
       : `原账本当前不可读 (${ledger.__error || 'I/O 异常'})，已阻止写入覆盖原有历史`;
-    return { ok: false, phase: ledger.__guardPhase || (ledger.__corrupted ? 'corrupted_guard' : 'unreadable_guard'), error: errMsg };
+    return {
+      ok: false,
+      phase: ledger.__guardPhase || (ledger.__corrupted ? 'corrupted_guard' : 'unreadable_guard'),
+      ...(ledger.__code ? { code: ledger.__code } : {}),
+      error: errMsg
+    };
   }
   const p = path.resolve(getPricingLedgerPath(overridePathOrDir));
   const cacheKey = normalizeLedgerKey(p);
@@ -530,12 +541,13 @@ function savePricingLedger(ledger, overridePathOrDir, options = {}) {
   return res;
 }
 
-function createRecordResult(ok, changed, error, phase) {
+function createRecordResult(ok, changed, error, phase, code) {
   return {
     ok: !!ok,
     changed: !!changed,
     error: error || undefined,
     phase: phase || undefined,
+    ...(code ? { code } : {}),
     valueOf() { return this.changed; }
   };
 }
@@ -655,7 +667,7 @@ function extractNormalizedDateInfo(e) {
   }
   if (parsedLocalFromCreated) {
     return {
-      rank: rawDate === parsedLocalFromCreated ? 3.5 : 3,
+      rank: 3,
       date: parsedLocalFromCreated,
       created_at: String(e.created_at),
       dateSource: e.dateSource || 'created_at',
@@ -674,16 +686,63 @@ function extractNormalizedDateInfo(e) {
   return { rank: 0, date: null, created_at: null, dateSource: null, dateIsProvisional: true };
 }
 
-function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitStep = null, preferIncomingModel = false) {
+function compareCallUsage(uA, uB) {
+  if (uA.tot !== uB.tot) return uA.tot - uB.tot;
+  return uA.out - uB.out;
+}
+
+function extractSourceRevision(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const raw = entry.sourceRevision ?? entry.revision ?? entry.metadataRevision;
+  if (raw !== undefined && raw !== null && raw !== '') {
+    const num = Number(raw);
+    if (Number.isFinite(num)) return num;
+  }
+  const rawUpdated = entry.updated_at ?? entry.sourceUpdatedAt;
+  if (rawUpdated !== undefined && rawUpdated !== null && rawUpdated !== '') {
+    const ts = typeof rawUpdated === 'number' ? rawUpdated : Date.parse(String(rawUpdated));
+    if (Number.isFinite(ts)) return ts;
+  }
+  return null;
+}
+
+function compareSourceRevision(incRev, baseRev) {
+  const a = typeof incRev === 'number' && Number.isFinite(incRev) ? incRev : null;
+  const b = typeof baseRev === 'number' && Number.isFinite(baseRev) ? baseRev : null;
+  if (a === null && b === null) return 0;
+  if (a !== null && b === null) return 1;
+  if (a === null && b !== null) return -1;
+  if (a === b) return 0;
+  return a > b ? 1 : -1;
+}
+
+function shouldAdoptSameRankAuthDate(baseEntry, incomingEntry, baseDateInfo, incDateInfo, usageCmp, revCmp, forceIncomingDate = false) {
+  const incomingIsStaleStatus = baseEntry.status === 'final' && Boolean(incomingEntry.status) && incomingEntry.status !== 'final';
+  if (incomingIsStaleStatus || !incDateInfo.date) return false;
+  if (!baseDateInfo.date) return true;
+  if (forceIncomingDate) return true;
+  // 同等级权威日期修订：需显式更新的修订号（且用量未回退）、严格增长的用量（且修订号未倒退）或 streaming -> final 状态完成；
+  // 已完成记录在无修订依据且同用量时保持首个权威日期（first-write-wins），阻断乱序旧包回滚与交替震荡
+  if (baseEntry.status !== 'final' && incomingEntry.status === 'final' && usageCmp >= 0 && revCmp >= 0) return true;
+  if (revCmp > 0 && usageCmp >= 0) return true;
+  if (usageCmp > 0 && revCmp >= 0) return true;
+  return false;
+}
+
+function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitStep = null, preferIncomingModel = false, preferIncomingDate = false) {
   const uBase = getCallTokenBreakdown(baseEntry);
   const uInc = getCallTokenBreakdown(incomingEntry);
+  const baseRev = extractSourceRevision(baseEntry);
+  const incRev = extractSourceRevision(incomingEntry);
+  const usageCmp = compareCallUsage(uInc, uBase);
+  const revCmp = compareSourceRevision(incRev, baseRev);
   const incomingIsStaleStatus = baseEntry.status === 'final' && Boolean(incomingEntry.status) && incomingEntry.status !== 'final';
-  const takeIncUsage = !incomingIsStaleStatus && (uInc.tot > uBase.tot || (uInc.tot === uBase.tot && uInc.out > uBase.out));
+  const takeIncUsage = !incomingIsStaleStatus && (usageCmp > 0 || (usageCmp === 0 && revCmp > 0));
 
   const inp = takeIncUsage ? uInc.inp : uBase.inp;
   const cap = takeIncUsage ? uInc.cap : uBase.cap;
   const out = takeIncUsage ? uInc.out : uBase.out;
-  const think = Math.max(uBase.think, uInc.think);
+  const think = takeIncUsage ? (uInc.out < uBase.out ? Math.min(uInc.out, uInc.think) : Math.max(uBase.think, uInc.think)) : uBase.think;
   const tot = takeIncUsage ? uInc.tot : uBase.tot;
 
   const mergedModel = preferIncomingModel && !incomingIsStaleStatus
@@ -705,12 +764,17 @@ function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitSt
 
   const baseDateInfo = extractNormalizedDateInfo(baseEntry);
   const incDateInfo = extractNormalizedDateInfo(incomingEntry);
+  const adoptSameRankDate = incDateInfo.rank >= 2 &&
+    incDateInfo.rank === baseDateInfo.rank &&
+    shouldAdoptSameRankAuthDate(baseEntry, incomingEntry, baseDateInfo, incDateInfo, usageCmp, revCmp, preferIncomingDate);
   let chosenDateInfo;
   if (incDateInfo.rank > baseDateInfo.rank) {
     chosenDateInfo = incDateInfo;
   } else if (baseDateInfo.rank > incDateInfo.rank) {
     chosenDateInfo = baseDateInfo;
-  } else if (baseDateInfo.date && incDateInfo.date) {
+  } else if (adoptSameRankDate) {
+    chosenDateInfo = incDateInfo;
+  } else if (incDateInfo.rank === 1 && baseDateInfo.date && incDateInfo.date) {
     chosenDateInfo = baseDateInfo.date <= incDateInfo.date ? baseDateInfo : incDateInfo;
   } else {
     chosenDateInfo = baseDateInfo.date ? baseDateInfo : incDateInfo;
@@ -719,10 +783,12 @@ function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitSt
   const mergedStatus = (baseEntry.status === 'final' || incomingEntry.status === 'final')
     ? 'final'
     : (incomingEntry.status || baseEntry.status || 'final');
+  const mergedRev = !incomingIsStaleStatus && revCmp >= 0 ? (incRev ?? baseRev) : baseRev;
 
   const merged = {
     ...baseEntry,
     ...(!incomingIsStaleStatus && takeIncUsage ? incomingEntry : {}),
+    ...(chosenDateInfo === incDateInfo && incomingEntry.timestamp !== undefined ? { timestamp: incomingEntry.timestamp } : {}),
     callId: canonicalKey,
     source: baseEntry.source || incomingEntry.source || 'desktop',
     ...(resolvedCascadeId ? { cascadeId: resolvedCascadeId } : {}),
@@ -739,8 +805,15 @@ function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitSt
     created_at: chosenDateInfo.created_at,
     ...(chosenDateInfo.dateSource ? { dateSource: chosenDateInfo.dateSource } : {}),
     dateIsProvisional: Boolean(chosenDateInfo.dateIsProvisional),
+    ...(mergedRev !== null ? { sourceRevision: mergedRev } : {}),
     updatedAt: Date.now()
   };
+  if (!chosenDateInfo.dateSource) {
+    delete merged.dateSource;
+  }
+  if (mergedRev === null) {
+    delete merged.sourceRevision;
+  }
 
   const costCalc = calculateRequestApiCost(merged);
   if (costCalc.isPriced) {
@@ -768,7 +841,7 @@ function isConfirmableSingleStepMatch(real, syn) {
   if (real.status === 'streaming' || uReal.tot === 0) {
     return true;
   }
-  if ((syn.status === 'streaming' || uSyn.tot === 0) && uSyn.tot <= uReal.tot && uSyn.out <= uReal.out) {
+  if ((syn.status === 'streaming' || uSyn.tot === 0) && compareCallUsage(uSyn, uReal) <= 0) {
     return true;
   }
   return false;
@@ -777,6 +850,7 @@ function isConfirmableSingleStepMatch(real, syn) {
 function callSemanticSignature(c) {
   if (!c || typeof c !== 'object') return '';
   const u = getCallTokenBreakdown(c);
+  const rev = extractSourceRevision(c);
   return [
     String(c.callId || ''),
     String(c.source || 'desktop'),
@@ -796,7 +870,8 @@ function callSemanticSignature(c) {
     String(c.date || ''),
     String(c.created_at || ''),
     String(c.dateSource || ''),
-    Boolean(c.dateIsProvisional)
+    Boolean(c.dateIsProvisional),
+    rev ?? ''
   ].join('|');
 }
 
@@ -932,7 +1007,8 @@ function recordModelCalls(newCalls = [], options = {}) {
       false,
       false,
       `${prefix} (${ledger.__corruptedPath})`,
-      ledger.__guardPhase || (ledger.__corrupted ? 'corrupted_guard' : 'unreadable_guard')
+      ledger.__guardPhase || (ledger.__corrupted ? 'corrupted_guard' : 'unreadable_guard'),
+      ledger.__code
     );
   }
 
@@ -954,6 +1030,7 @@ function recordModelCalls(newCalls = [], options = {}) {
       const normalizedStep = extractCallStepNumbers(call, targetKey)[0] ?? null;
       const uInc = getCallTokenBreakdown(call);
       const dInfo = extractNormalizedDateInfo(call);
+      const incRev = extractSourceRevision(call);
       const nextEntry = {
         ...call,
         callId: targetKey,
@@ -964,8 +1041,12 @@ function recordModelCalls(newCalls = [], options = {}) {
         ...(dInfo.created_at ? { created_at: dInfo.created_at } : (dInfo.dateIsProvisional ? { created_at: null } : {})),
         ...(dInfo.dateSource ? { dateSource: dInfo.dateSource } : {}),
         dateIsProvisional: Boolean(dInfo.dateIsProvisional),
+        ...(incRev !== null ? { sourceRevision: incRev } : {}),
         updatedAt: Date.now()
       };
+      if (incRev === null) {
+        delete nextEntry.sourceRevision;
+      }
       if (dInfo.date && dInfo.date !== call.date) {
         const recalc = calculateRequestApiCost(nextEntry);
         if (recalc.isPriced) {
@@ -980,14 +1061,33 @@ function recordModelCalls(newCalls = [], options = {}) {
 
     const uExist = getCallTokenBreakdown(existing);
     const uCall = getCallTokenBreakdown(call);
+    const usageCmp = compareCallUsage(uCall, uExist);
+    const existRev = extractSourceRevision(existing);
+    const callRev = extractSourceRevision(call);
+    const revCmp = compareSourceRevision(callRev, existRev);
+    const incomingIsStaleStatus = existing.status === 'final' && Boolean(call.status) && call.status !== 'final';
+    const isUsageRollback = incomingIsStaleStatus || (existing.status === 'final' && usageCmp < 0);
     const existDateInfo = extractNormalizedDateInfo(existing);
     const callDateInfo = extractNormalizedDateInfo(call);
+    const trustIncomingTranscriptDate = Boolean(options.trustTranscriptDate && callDateInfo.dateSource === 'transcript');
+    const adoptIncomingSameRankDate = callDateInfo.rank >= 2 &&
+      callDateInfo.rank === existDateInfo.rank &&
+      shouldAdoptSameRankAuthDate(existing, call, existDateInfo, callDateInfo, usageCmp, revCmp, trustIncomingTranscriptDate);
+    const sameRankAuthDateProgressed = adoptIncomingSameRankDate && (
+      callDateInfo.date !== existDateInfo.date ||
+      (callDateInfo.rank >= 3 && Boolean(callDateInfo.created_at) && callDateInfo.created_at !== existDateInfo.created_at)
+    );
     const dateProgressed = (
       callDateInfo.rank > existDateInfo.rank ||
+      sameRankAuthDateProgressed ||
       (existing.date && existDateInfo.date && existing.date !== existDateInfo.date)
     ) && Boolean(callDateInfo.date || existDateInfo.date);
     const stateProgressed = existing.status !== 'final' && call.status === 'final';
-    const usageProgressed = uCall.tot > uExist.tot || (uCall.tot === uExist.tot && uCall.out > uExist.out);
+    const usageProgressed = !incomingIsStaleStatus && usageCmp > 0;
+    const revisionUsageProgressed = !isUsageRollback && usageCmp === 0 && revCmp > 0 && (
+      uCall.inp !== uExist.inp || uCall.cap !== uExist.cap || uCall.think !== uExist.think
+    );
+    const revisionMetaProgressed = !isUsageRollback && revCmp > 0 && callRev !== existRev;
     const modelProgressed = getCollectorModelRank(call.model) > getCollectorModelRank(existing.model);
     const recalcExist = calculateRequestApiCost(existing);
     const costOutOfSync = Boolean(recalcExist.isPriced) !== Boolean(existing.isPriced)
@@ -995,11 +1095,16 @@ function recordModelCalls(newCalls = [], options = {}) {
     const pricingProgressed = costOutOfSync || ((!existing.isPriced || !existing.costUSD) && Boolean((call.isPriced && call.costUSD > 0) || normalizeModelId(call.model || existing.model)));
     const resolvedStepIndex = existing.stepIndex ?? call.stepIndex ?? extractCallStepNumbers(existing, targetKey)[0] ?? extractCallStepNumbers(call, targetKey)[0] ?? null;
     const metaProgressed = (existing.stepIndex == null && resolvedStepIndex != null) || (!existing.cascadeId && Boolean(callCidRaw));
-    const isUsageRollback = (existing.status === 'final' && Boolean(call.status) && call.status !== 'final') ||
-      (existing.status === 'final' && (uCall.tot < uExist.tot || uCall.out < uExist.out));
 
-    if (modelProgressed || metaProgressed || dateProgressed || (!isUsageRollback && (stateProgressed || usageProgressed || pricingProgressed))) {
-      draftCalls[targetKey] = mergeSameCallRecords(existing, call, targetKey, resolvedStepIndex, !isUsageRollback);
+    if (modelProgressed || metaProgressed || dateProgressed || (!isUsageRollback && (stateProgressed || usageProgressed || revisionUsageProgressed || revisionMetaProgressed || pricingProgressed))) {
+      draftCalls[targetKey] = mergeSameCallRecords(
+        existing,
+        call,
+        targetKey,
+        resolvedStepIndex,
+        !isUsageRollback && revCmp >= 0,
+        adoptIncomingSameRankDate
+      );
     }
   }
 
@@ -1016,7 +1121,7 @@ function recordModelCalls(newCalls = [], options = {}) {
     };
     const saveRes = savePricingLedger(draftLedger, targetDir, fsOpt);
     if (!saveRes.ok) {
-      return createRecordResult(false, false, saveRes.error || '保存账本落盘失败', saveRes.phase);
+      return createRecordResult(false, false, saveRes.error || '保存账本落盘失败', saveRes.phase, saveRes.code);
     }
     if (!targetDir) {
       cachedTokenHistoryAt = 0;
@@ -1919,7 +2024,7 @@ async function collectTokenHistoryAsync(options = {}) {
     const targetCallId = (cIsFallback && !mIsFallback) ? mId : cidKey;
 
     const uC = getCallTokenBreakdown(c);
-    const merged = mergeSameCallRecords(c, matched, targetCallId, null, false);
+    const merged = mergeSameCallRecords(c, matched, targetCallId, null, false, true);
     const uMerged = getCallTokenBreakdown(merged);
 
     const keyChanged = targetCallId !== ledgerKey;
@@ -2004,7 +2109,7 @@ async function collectTokenHistoryAsync(options = {}) {
     }
   }
 
-  // Pass 2: 兼容尚未记录 stepIndex 的历史账本条目，按同会话精确非零用量指纹 + 兼容模型 1-to-1 匹配
+  // Pass 2: 兼容尚未记录 stepIndex 的历史账本条目，按同会话精确非零用量指纹 + 兼容模型双边唯一（1-to-1）匹配
   if (unmatchedLedgerPass2.length) {
     const reqsByUsageKey = new Map();
     for (const r of recentRequests) {
@@ -2016,19 +2121,45 @@ async function collectTokenHistoryAsync(options = {}) {
       if (!list) { list = []; reqsByUsageKey.set(uKey, list); }
       list.push(r);
     }
+    const ledgerCandsByUsageKey = new Map();
     for (const [ledgerKey, c] of unmatchedLedgerPass2) {
       if (!c.cascadeId) continue;
       if (c.stepIndex !== null && c.stepIndex !== undefined) continue;
-      const cidKey = String(c.callId || ledgerKey);
+      if (extractCallStepNumbers(c, ledgerKey).length > 0) continue;
       const uC = getCallTokenBreakdown(c);
       if (uC.inp + uC.cap + uC.out <= 0) continue;
       const uKey = `${c.source || 'desktop'}:${String(c.cascadeId).toLowerCase()}:${uC.inp}:${uC.cap}:${uC.out}`;
-      const matched = takeUnmatchedReq(
-        reqsByUsageKey.get(uKey),
-        (item) => canFallbackLink(ledgerKey, c, cidKey, item) && areModelsCompatible(c.model, item.model)
-      );
-      if (matched) {
-        applyTranscriptMatch(ledgerKey, c, cidKey, matched);
+      let list = ledgerCandsByUsageKey.get(uKey);
+      if (!list) { list = []; ledgerCandsByUsageKey.set(uKey, list); }
+      list.push([ledgerKey, c, String(c.callId || ledgerKey)]);
+    }
+    for (const [uKey, ledgerGroup] of ledgerCandsByUsageKey.entries()) {
+      const reqCandidates = (reqsByUsageKey.get(uKey) || []).filter(item => !matchedTranscriptReqs.has(item));
+      if (!reqCandidates.length) continue;
+      // 仅当账本候选与未匹配 transcript 候选在兼容二分图上互为唯一候选（双边度数均为 1）时才执行绑定，消除遍历顺序依赖
+      const reqToCompatibleLedgers = new Map();
+      const ledgerToCompatibleReqs = new Map();
+      for (const lEntry of ledgerGroup) {
+        const [ledgerKey, c, cidKey] = lEntry;
+        const compatReqs = reqCandidates.filter(
+          item => canFallbackLink(ledgerKey, c, cidKey, item) && areModelsCompatible(c.model, item.model)
+        );
+        ledgerToCompatibleReqs.set(lEntry, compatReqs);
+        for (const rItem of compatReqs) {
+          let lList = reqToCompatibleLedgers.get(rItem);
+          if (!lList) { lList = []; reqToCompatibleLedgers.set(rItem, lList); }
+          lList.push(lEntry);
+        }
+      }
+      for (const lEntry of ledgerGroup) {
+        const compatReqs = ledgerToCompatibleReqs.get(lEntry) || [];
+        if (compatReqs.length !== 1) continue;
+        const targetReq = compatReqs[0];
+        if ((reqToCompatibleLedgers.get(targetReq) || []).length !== 1) continue;
+        if (matchedTranscriptReqs.has(targetReq)) continue;
+        matchedTranscriptReqs.add(targetReq);
+        const [ledgerKey, c, cidKey] = lEntry;
+        applyTranscriptMatch(ledgerKey, c, cidKey, targetReq);
       }
     }
   }
@@ -2037,13 +2168,13 @@ async function collectTokenHistoryAsync(options = {}) {
   const unmatchedPricedTranscriptReqs = recentRequests.filter(r => !matchedTranscriptReqs.has(r) && r.isPriced && r.callId);
   const ledgerUpdates = [...ledgerEnrichmentCalls, ...unmatchedPricedTranscriptReqs];
   if (ledgerUpdates.length) {
-    recordModelCalls(ledgerUpdates, { agDir });
+    recordModelCalls(ledgerUpdates, { agDir, trustTranscriptDate: true });
   }
 
   const effectiveCallsMap = { ...(loadPricingLedger(agDir).calls || {}) };
   for (const [origKey, { targetCallId, merged }] of inMemoryEnrichments.entries()) {
     if (effectiveCallsMap[targetCallId]) {
-      effectiveCallsMap[targetCallId] = mergeSameCallRecords(effectiveCallsMap[targetCallId], merged, targetCallId, merged.stepIndex, false);
+      effectiveCallsMap[targetCallId] = mergeSameCallRecords(effectiveCallsMap[targetCallId], merged, targetCallId, merged.stepIndex, false, true);
     } else if (effectiveCallsMap[origKey]) {
       if (targetCallId !== origKey) delete effectiveCallsMap[origKey];
       effectiveCallsMap[targetCallId] = merged;

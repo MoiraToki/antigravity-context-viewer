@@ -3259,7 +3259,7 @@ test('[P2] renderer watermark re-sends when RPC upgrades provisional date to aut
     if (prevWindow === undefined) delete globalThis.window;
     else globalThis.window = prevWindow;
     api.dispose();
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch {}
   }
 });
 
@@ -3418,6 +3418,372 @@ test('[P3] provisional Carbon call crossing 11-30 -> 12-01 rate-hike midnight do
     if (prevWindow === undefined) delete globalThis.window;
     else globalThis.window = prevWindow;
     api.dispose();
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch {}
+  }
+});
+
+test('[P2] same-rank authoritative created_at revision updates persisted ledger date & costUSD and settles cleanly', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls } = require('./meter-collector');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-renderer-same-rank-date-'));
+  const ledgerPath = path.join(tempDir, 'pricing_ledger_v1.json');
+  const prevWindow = globalThis.window;
+  const origDateNow = Date.now;
+
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  const flushAsync = async () => {
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  };
+
+  let fakeNow = new Date(2026, 11, 1, 12, 0, 0).getTime();
+  const realDate = h.sandbox.Date;
+  const MockDate = function (...args) {
+    return args.length ? new realDate(...args) : new realDate(fakeNow);
+  };
+  MockDate.now = () => fakeNow;
+  MockDate.parse = realDate.parse;
+  MockDate.UTC = realDate.UTC;
+  h.sandbox.Date = MockDate;
+
+  globalThis.window = h.sandbox.window;
+  Date.now = () => fakeNow;
+
+  h.finishScan(0);
+  await flushAsync();
+
+  const events = [];
+  h.sandbox.window.contextMeterAPI = {
+    ...h.sandbox.window.contextMeterAPI,
+    recordCalls: calls => {
+      const res = recordModelCalls(calls, { agDir: tempDir });
+      const desc = calls.map(c => `${c.callId}:${c.date}:${c.costUSD}:changed=${res.changed}`).join(',');
+      events.push(`recordCalls:${desc}`);
+      return Promise.resolve({ ok: res.ok, changed: res.changed, error: res.error, phase: res.phase, code: res.code });
+    },
+    getTokenHistory: force => {
+      events.push(`getTokenHistory:${Boolean(force)}`);
+      return Promise.resolve({
+        ok: true,
+        data: {
+          updatedAt: '2026-12-01 12:00:00',
+          summary: { grandTotalTokens: 360000, todayTokens: 360000 },
+          dailyMap: { '2026-12-01': { total: 360000, input: 250000, cache: 100000, output: 10000, steps: 1 } }
+        }
+      });
+    }
+  };
+
+  try {
+    // 1) 初始权威时间 2026-11-12 入账 ($0.61, sourceRevision: 1)
+    const rowNov = {
+      stepIndices: [1],
+      status: 'final',
+      sourceRevision: 1,
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_same_rank_e2e' },
+        chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } }
+      }
+    };
+    h.pending[0].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNov] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_same_rank_e2e:2026-11-12:0.61:changed=true',
+      'getTokenHistory:true'
+    ]);
+    let disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_same_rank_e2e.date, '2026-11-12');
+    assert.equal(disk.calls.resp_same_rank_e2e.costUSD, 0.61);
+
+    // 2) 同等级 created_at 正向修正至 2026-12-01 (sourceRevision: 2, 同用量 360k)：后端返回 changed=true 并更新磁盘为 12-01 / $1.22
+    events.length = 0;
+    fakeNow += 6000;
+    const rowDec = {
+      ...rowNov,
+      sourceRevision: 2,
+      created_at: '2026-12-01T10:00:00Z'
+    };
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowDec] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_same_rank_e2e:2026-12-01:1.22:changed=true',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_same_rank_e2e.date, '2026-12-01');
+    assert.equal(disk.calls.resp_same_rank_e2e.costUSD, 1.22);
+    assert.equal(api.snapshot().sessionCostTotal, 1.22);
+
+    // 2b) 新修正 -> 同用量旧包 (rev=1 及无版本旧包) -> 重复旧包（含切路由再切回）：严禁重发或回滚日期/费用
+    const rowNovUnversioned = { ...rowNov };
+    delete rowNovUnversioned.sourceRevision;
+    for (const staleVariant of [rowNov, rowNov, rowNovUnversioned]) {
+      events.length = 0;
+      fakeNow += 3500;
+      h.tick();
+      h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [staleVariant] }) });
+      await flushAsync();
+      assert.deepEqual(events, [], '同用量旧包及重复旧包不得触发重传');
+      assert.equal(api.snapshot().sessionCostTotal, 1.22);
+    }
+    h.sandbox.location.pathname = '/c/22222222-2222-2222-2222-222222222222';
+    fakeNow += 3500;
+    h.tick();
+    await flushAsync();
+    h.sandbox.location.pathname = '/c/11111111-1111-1111-1111-111111111111';
+    fakeNow += 3500;
+    h.tick();
+    if (h.scans.length > 0) h.finishScan(h.scans.length - 1);
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovUnversioned] }) });
+    await flushAsync();
+    assert.deepEqual(events, [], '跨路由切回后收到同用量旧包依然零重发、零回滚');
+    assert.equal(api.snapshot().sessionCostTotal, 1.22);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_same_rank_e2e.date, '2026-12-01');
+    assert.equal(disk.calls.resp_same_rank_e2e.costUSD, 1.22);
+
+    // 3) 同等级 created_at 逆向修正回 2026-11-15 (sourceRevision: 3)：双向校准更新磁盘回 2026-11-15 / $0.61，随后迟到 rev=2 零重发
+    events.length = 0;
+    fakeNow += 6000;
+    const rowNovRevised = {
+      ...rowNov,
+      sourceRevision: 3,
+      created_at: '2026-11-15T10:00:00Z'
+    };
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRevised] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_same_rank_e2e:2026-11-15:0.61:changed=true',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_same_rank_e2e.date, '2026-11-15');
+    assert.equal(disk.calls.resp_same_rank_e2e.costUSD, 0.61);
+    assert.equal(api.snapshot().sessionCostTotal, 0.61);
+
+    for (const staleAfterRev3 of [rowDec, rowDec]) {
+      events.length = 0;
+      fakeNow += 3500;
+      h.tick();
+      h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [staleAfterRev3] }) });
+      await flushAsync();
+      assert.deepEqual(events, [], '逆向校准后迟到的高费率旧修订包不得触发重发');
+      assert.equal(api.snapshot().sessionCostTotal, 0.61);
+    }
+
+    // 4) 无版本冲突交替场景 ([11-12, 12-01, 11-12, 12-01])：保持首个已确认权威日期，零反复重发
+    events.length = 0;
+    fakeNow += 6000;
+    const rowUnvA = {
+      stepIndices: [2],
+      status: 'final',
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_unv_alt' },
+        chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } }
+      }
+    };
+    const rowUnvB = { ...rowUnvA, created_at: '2026-12-01T10:00:00Z' };
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRevised, rowUnvA] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_unv_alt:2026-11-12:0.61:changed=true',
+      'getTokenHistory:true'
+    ]);
+    for (const alt of [rowUnvB, rowUnvA, rowUnvB]) {
+      events.length = 0;
+      fakeNow += 3500;
+      h.tick();
+      h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRevised, alt] }) });
+      await flushAsync();
+      assert.deepEqual(events, [], '两版无版本同用量快照交替到达时不得重发震荡');
+      assert.equal(api.snapshot().sessionCostTotal, 1.22); // 0.61 + 0.61
+    }
+
+    // 5) “总量增加、输出量下降”交叉变化前后端联动：input=100k,out=20k,tot=120k,11-12 ($0.40) -> input=130k,out=10k,tot=140k,12-01 ($0.72)
+    fakeNow += 6000;
+    const rowCross1 = {
+      stepIndices: [3],
+      status: 'final',
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 100000, cacheReadTokens: 0, outputTokens: 20000, responseId: 'resp_cross_e2e' },
+        chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } }
+      }
+    };
+    const rowCross2 = {
+      ...rowCross1,
+      created_at: '2026-12-01T10:00:00Z',
+      chatModel: {
+        ...rowCross1.chatModel,
+        usage: { inputTokens: 130000, cacheReadTokens: 0, outputTokens: 10000, responseId: 'resp_cross_e2e' }
+      }
+    };
+    h.tick();
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRevised, rowUnvA, rowCross1] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_cross_e2e:2026-11-12:0.4:changed=true',
+      'getTokenHistory:true'
+    ]);
+
+    fakeNow += 6000;
+    h.tick();
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRevised, rowUnvA, rowCross2] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_cross_e2e:2026-12-01:0.72:changed=true',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_cross_e2e.inputTokens, 130000);
+    assert.equal(disk.calls.resp_cross_e2e.outputTokens, 10000);
+    assert.equal(disk.calls.resp_cross_e2e.totalTokens, 140000);
+    assert.equal(disk.calls.resp_cross_e2e.date, '2026-12-01');
+    assert.equal(disk.calls.resp_cross_e2e.costUSD, 0.72);
+    assert.equal(Number(api.snapshot().sessionCostTotal.toFixed(4)), 1.94); // 0.61 + 0.61 + 0.72
+
+    // 迟到的旧交叉快照 (120k/20k, 11-12) 到达时零重发，磁盘与面板完全一致
+    events.length = 0;
+    fakeNow += 3500;
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRevised, rowUnvA, rowCross1] }) });
+    await flushAsync();
+    assert.deepEqual(events, []);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_cross_e2e.totalTokens, 140000);
+    assert.equal(disk.calls.resp_cross_e2e.outputTokens, 10000);
+    assert.equal(disk.calls.resp_cross_e2e.date, '2026-12-01');
+    assert.equal(disk.calls.resp_cross_e2e.costUSD, 0.72);
+
+    // 6a) 仅显式修订号提升 (sourceRevision: 3 -> 4，日期/总量/输出均未变)：提交 1 次更新账本版本，随后零重发
+    fakeNow += 6000;
+    const rowNovRev4 = { ...rowNovRevised, sourceRevision: 4 };
+    h.tick();
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRev4, rowUnvA, rowCross2] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_same_rank_e2e:2026-11-15:0.61:changed=true',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_same_rank_e2e.sourceRevision, 4);
+
+    events.length = 0;
+    fakeNow += 3500;
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRev4, rowUnvA, rowCross2] }) });
+    await flushAsync();
+    assert.deepEqual(events, [], '仅修订号提升提交确认后，后续相同修订号轮询必须零重发');
+
+    // 6b) 同总量/输出量下输入与缓存重新分配导致费用下降 (rev=1: inp=1M,cap=0,$2.10 -> rev=2: inp=100k,cap=900k,$0.39) 及迟到旧版防护
+    fakeNow += 6000;
+    const rowSplitRev1 = {
+      stepIndices: [4],
+      status: 'final',
+      sourceRevision: 1,
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 1000000, cacheReadTokens: 0, outputTokens: 10000, responseId: 'resp_split_rebalance' },
+        chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 1048576 } }
+      }
+    };
+    const rowSplitRev2 = {
+      ...rowSplitRev1,
+      sourceRevision: 2,
+      chatModel: {
+        ...rowSplitRev1.chatModel,
+        usage: { inputTokens: 100000, cacheReadTokens: 900000, outputTokens: 10000, responseId: 'resp_split_rebalance' }
+      }
+    };
+    h.tick();
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRev4, rowUnvA, rowCross2, rowSplitRev1] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_split_rebalance:2026-11-12:2.1:changed=true',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_split_rebalance.inputTokens, 1000000);
+    assert.equal(disk.calls.resp_split_rebalance.cacheTokens, 0);
+    assert.equal(disk.calls.resp_split_rebalance.costUSD, 2.1);
+
+    fakeNow += 6000;
+    h.tick();
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRev4, rowUnvA, rowCross2, rowSplitRev2] }) });
+    await flushAsync();
+    assert.deepEqual(events, [
+      'recordCalls:resp_split_rebalance:2026-11-12:0.39:changed=true',
+      'getTokenHistory:true'
+    ]);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_split_rebalance.inputTokens, 100000);
+    assert.equal(disk.calls.resp_split_rebalance.cacheTokens, 900000);
+    assert.equal(disk.calls.resp_split_rebalance.costUSD, 0.39);
+    assert.equal(disk.calls.resp_split_rebalance.sourceRevision, 2);
+    assert.equal(Number(api.snapshot().sessionCostTotal.toFixed(4)), 2.33); // 0.61 + 0.61 + 0.72 + 0.39
+
+    // 迟到的高费用旧版本 rev=1 ($2.10) 在同路由与跨路由切回后均不得覆盖或重发
+    events.length = 0;
+    fakeNow += 3500;
+    h.tick();
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRev4, rowUnvA, rowCross2, rowSplitRev1] }) });
+    await flushAsync();
+    assert.deepEqual(events, []);
+    assert.equal(Number(api.snapshot().sessionCostTotal.toFixed(4)), 2.33);
+
+    h.sandbox.location.pathname = '/c/22222222-2222-2222-2222-222222222222';
+    fakeNow += 3500;
+    h.tick();
+    await flushAsync();
+    h.sandbox.location.pathname = '/c/11111111-1111-1111-1111-111111111111';
+    fakeNow += 3500;
+    h.tick();
+    if (h.scans.length > 0) h.finishScan(h.scans.length - 1);
+    await flushAsync();
+    events.length = 0;
+    h.pending[h.pending.length - 1].resolve({ ok: true, json: async () => ({ generatorMetadata: [rowNovRev4, rowUnvA, rowCross2, rowSplitRev1] }) });
+    await flushAsync();
+    assert.deepEqual(events, [], '跨路由切回后收到同总量高费用旧版本 rev=1 仍不得覆盖或重发');
+    assert.equal(Number(api.snapshot().sessionCostTotal.toFixed(4)), 2.33);
+    disk = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    assert.equal(disk.calls.resp_split_rebalance.inputTokens, 100000);
+    assert.equal(disk.calls.resp_split_rebalance.cacheTokens, 900000);
+    assert.equal(disk.calls.resp_split_rebalance.costUSD, 0.39);
+  } finally {
+    Date.now = origDateNow;
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    api.dispose();
+    try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch {}
   }
 });

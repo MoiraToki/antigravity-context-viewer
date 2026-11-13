@@ -448,6 +448,7 @@ test('[P1] loadPricingLedger & recordModelCalls: statSync EBUSY、readFileSync E
     assert.equal(resStatBusy.ok, false);
     assert.equal(resStatBusy.changed, false);
     assert.equal(resStatBusy.phase, 'unreadable_guard');
+    assert.equal(resStatBusy.code, 'EBUSY');
     assert.deepEqual(
       Object.keys(JSON.parse(origReadFileSync(ledgerPath, 'utf8')).calls).sort(),
       ['call-guard-A', 'call-guard-B'],
@@ -471,6 +472,7 @@ test('[P1] loadPricingLedger & recordModelCalls: statSync EBUSY、readFileSync E
     assert.equal(resReadDenied.ok, false);
     assert.equal(resReadDenied.changed, false);
     assert.equal(resReadDenied.phase, 'unreadable_guard');
+    assert.equal(resReadDenied.code, 'EACCES');
     assert.deepEqual(
       Object.keys(JSON.parse(origReadFileSync(ledgerPath, 'utf8')).calls).sort(),
       ['call-guard-A', 'call-guard-B'],
@@ -497,10 +499,49 @@ test('[P1] loadPricingLedger & recordModelCalls: statSync EBUSY、readFileSync E
     assert.equal(resExistsMismatch.ok, false);
     assert.equal(resExistsMismatch.changed, false);
     assert.equal(resExistsMismatch.phase, 'unreadable_guard');
+    assert.equal(resExistsMismatch.code, 'ENOENT');
     assert.deepEqual(
       Object.keys(JSON.parse(origReadFileSync(ledgerPath, 'utf8')).calls).sort(),
       ['call-guard-A', 'call-guard-B'],
       'stat 存在但后续读取返回 exists:false 时必须阻断写入保留 A+B'
+    );
+
+    // 3b. renameSync 阶段出现 EPERM 锁冲突时，同样向上层完整透传 code: 'EPERM' 且保留原文件
+    const renameBusyFs = {
+      ...fs,
+      renameSync() {
+        const err = new Error('EPERM: operation not permitted, rename');
+        err.code = 'EPERM';
+        throw err;
+      }
+    };
+    const resRenamePerm = recordModelCalls([callC], { agDir: tempDir, fs: renameBusyFs });
+    assert.equal(resRenamePerm.ok, false);
+    assert.equal(resRenamePerm.changed, false);
+    assert.equal(resRenamePerm.phase, 'rename');
+    assert.equal(resRenamePerm.code, 'EPERM');
+
+    // 3c. pre_verify 临时文件读回校验出现 EACCES 锁冲突时，同样完整透传 phase: 'pre_verify' 与 code: 'EACCES' 且保留原文件
+    const preVerifyDeniedFs = {
+      ...fs,
+      readFileSync(p, ...rest) {
+        if (String(p).endsWith('.tmp')) {
+          const err = new Error('EACCES: permission denied, open tmp');
+          err.code = 'EACCES';
+          throw err;
+        }
+        return origReadFileSync.call(fs, p, ...rest);
+      }
+    };
+    const resPreVerifyErr = recordModelCalls([callC], { agDir: tempDir, fs: preVerifyDeniedFs });
+    assert.equal(resPreVerifyErr.ok, false);
+    assert.equal(resPreVerifyErr.changed, false);
+    assert.equal(resPreVerifyErr.phase, 'pre_verify');
+    assert.equal(resPreVerifyErr.code, 'EACCES');
+    assert.deepEqual(
+      Object.keys(JSON.parse(origReadFileSync(ledgerPath, 'utf8')).calls).sort(),
+      ['call-guard-A', 'call-guard-B'],
+      'pre_verify 读回失败时必须保留原账本 A+B'
     );
 
     // 4. 故障解除后重试写入 C：成功读取既有 A + B 并合并落盘得到 A + B + C
@@ -515,6 +556,52 @@ test('[P1] loadPricingLedger & recordModelCalls: statSync EBUSY、readFileSync E
     }
   } finally {
     fs.statSync = origStatSync;
+    fs.readFileSync = origReadFileSync;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('loadPricingLedger: 读取前后 statSync (mtimeMs / size) 发生变化时拒绝写入陈旧缓存，下次读取自动加载新内容', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-ledger-stat-race-'));
+  const ledgerPath = path.resolve(path.join(tempDir, 'pricing_ledger_v1.json'));
+  const origReadFileSync = fs.readFileSync;
+  try {
+    const v1 = {
+      version: '1.0.0',
+      updatedAt: '2026-11-12T00:00:00Z',
+      calls: { 'call-v1': { callId: 'call-v1', totalTokens: 100, status: 'final' } }
+    };
+    const v2 = {
+      version: '1.0.0',
+      updatedAt: '2026-11-12T00:00:05Z',
+      calls: {
+        'call-v1': { callId: 'call-v1', totalTokens: 100, status: 'final' },
+        'call-v2-concurrent': { callId: 'call-v2-concurrent', totalTokens: 999, status: 'final' }
+      }
+    };
+    fs.writeFileSync(ledgerPath, JSON.stringify(v1, null, 2) + '\n', 'utf8');
+
+    // 模拟在 readFileSync 刚读出旧内容 v1 后、post-read statSync 执行前，外部进程并发原子更新了账本为 v2
+    let injectedConcurrentWrite = false;
+    fs.readFileSync = function (p, ...rest) {
+      const content = origReadFileSync.call(fs, p, ...rest);
+      if (!injectedConcurrentWrite && path.resolve(String(p)) === ledgerPath) {
+        injectedConcurrentWrite = true;
+        fs.writeFileSync(ledgerPath, JSON.stringify(v2, null, 2) + '\n', 'utf8');
+      }
+      return content;
+    };
+
+    const firstRead = loadPricingLedger(tempDir);
+    fs.readFileSync = origReadFileSync;
+    assert.equal(Boolean(firstRead.calls['call-v1']), true);
+    assert.equal(Boolean(firstRead.calls['call-v2-concurrent']), false);
+
+    // 若旧实现直接用 stAfter 缓存了 firstRead，则此处会命中 v2 的 (mtimeMs, size) 却永久返回缺失 call-v2-concurrent 的陈旧数据
+    const secondRead = loadPricingLedger(tempDir);
+    assert.equal(Boolean(secondRead.calls['call-v2-concurrent']), true, '读取前后 stat 不一致时不得缓存旧快照');
+    assert.equal(secondRead.calls['call-v2-concurrent'].totalTokens, 999);
+  } finally {
     fs.readFileSync = origReadFileSync;
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
