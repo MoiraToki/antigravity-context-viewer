@@ -3491,38 +3491,124 @@
     const hasDate = Boolean(call.date && /^\d{4}-\d{2}-\d{2}/.test(String(call.date)));
     const isProv = call.dateIsProvisional === true || call.dateSource === 'provisional';
     if (isProv) return hasDate ? 1 : 0;
-    if (call.dateSource === 'transcript' && (hasDate || call.created_at)) return 4;
-    if (call.created_at) return 3;
+    let hasValidCreatedAt = false;
+    if (call.created_at) {
+      const dt = new Date(call.created_at);
+      hasValidCreatedAt = !Number.isNaN(dt.getTime());
+    }
+    if (call.dateSource === 'transcript' && (hasDate || hasValidCreatedAt)) return 4;
+    if (hasValidCreatedAt) return 3;
     if (hasDate) return 2;
     return 0;
   };
 
+  const resolveWatermarkDate = call => {
+    if (!call) return '';
+    const isProv = call.dateIsProvisional === true || call.dateSource === 'provisional';
+    if (!isProv && call.created_at) {
+      const dt = new Date(call.created_at);
+      if (!Number.isNaN(dt.getTime())) return formatLocalYmd(dt);
+    }
+    return (call.date && /^\d{4}-\d{2}-\d{2}/.test(String(call.date))) ? String(call.date).slice(0, 10) : '';
+  };
+
+  const extractSourceRevision = row => {
+    if (!row || typeof row !== 'object') return null;
+    const raw = row.sourceRevision ?? row.revision ?? row.metadataRevision;
+    if (raw !== undefined && rawRevIsPresent(raw)) {
+      const num = Number(raw);
+      if (Number.isFinite(num)) return num;
+    }
+    const rawUpdated = row.updated_at ?? row.sourceUpdatedAt;
+    if (rawUpdated !== undefined && rawRevIsPresent(rawUpdated)) {
+      const ts = typeof rawUpdated === 'number' ? rawUpdated : Date.parse(String(rawUpdated));
+      if (Number.isFinite(ts)) return ts;
+    }
+    return null;
+  };
+
+  function rawRevIsPresent(val) {
+    return val !== null && val !== '';
+  }
+
+  const compareSourceRevision = (incRev, baseRev) => {
+    const a = typeof incRev === 'number' && Number.isFinite(incRev) ? incRev : null;
+    const b = typeof baseRev === 'number' && Number.isFinite(baseRev) ? baseRev : null;
+    if (a === null && b === null) return 0;
+    if (a !== null && b === null) return 1;
+    if (a === null && b !== null) return -1;
+    if (a === b) return 0;
+    return a > b ? 1 : -1;
+  };
+
+  const compareWatermarkUsage = (a, b) => {
+    const totDiff = (a?.tot || 0) - (b?.tot || 0);
+    if (totDiff !== 0) return totDiff;
+    return (a?.out || 0) - (b?.out || 0);
+  };
+
+  const canAdoptNextDate = (nextWm, prevWm) => {
+    if (!prevWm) return Boolean(nextWm?.date);
+    const nextDateRank = nextWm?.dateRank || 0;
+    const prevDateRank = prevWm?.dateRank || 0;
+    if (nextDateRank > prevDateRank) return Boolean(nextWm?.date);
+    if (nextDateRank < prevDateRank) return false;
+    if (!nextWm?.date) return false;
+    if (!prevWm?.date) return true;
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    if (nextDateRank >= 2) {
+      if (revCmp > 0 && usageCmp >= 0) return true;
+      if (usageCmp > 0 && revCmp >= 0) return true;
+      return nextWm.date === prevWm.date && (nextWm.createdAt || '') === (prevWm.createdAt || '') && revCmp >= 0 && usageCmp >= 0;
+    }
+    return nextWm.date < prevWm.date;
+  };
+
   const getFinalCallWatermark = call => ({
+    inp: call?.inputTokens || 0,
+    cap: call?.cacheTokens || 0,
     tot: (call?.inputTokens || 0) + (call?.cacheTokens || 0) + (call?.outputTokens || 0),
     out: call?.outputTokens || 0,
     model: String(call?.model || '').trim(),
     modelKey: String(call?.modelKey || '').trim(),
     isPriced: Boolean(call?.isPriced),
     costUSD: Number(call?.costUSD || 0),
-    date: call?.date ? String(call.date).slice(0, 10) : '',
-    dateRank: getDateRank(call)
+    date: resolveWatermarkDate(call),
+    createdAt: call?.created_at ? String(call.created_at) : '',
+    dateSource: call?.dateSource ? String(call.dateSource) : '',
+    dateRank: getDateRank(call),
+    sourceRevision: extractSourceRevision(call)
   });
 
   function hasWatermarkProgressed(nextWm, prevWm) {
     if (!prevWm) return true;
-    if (nextWm.tot > prevWm.tot || nextWm.out > prevWm.out) return true;
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    if (usageCmp > 0) return true;
     if (getModelRank(nextWm.model, nextWm.modelKey) > getModelRank(prevWm.model, prevWm.modelKey)) return true;
     if (!prevWm.modelKey && Boolean(nextWm.modelKey)) return true;
     if (!prevWm.isPriced && Boolean(nextWm.isPriced)) return true;
     const nextDateRank = nextWm.dateRank || 0;
     const prevDateRank = prevWm.dateRank || 0;
     if (nextDateRank > prevDateRank) return true;
-    if (nextDateRank >= 2 && nextDateRank === prevDateRank && Boolean(nextWm.date) && nextWm.date !== prevWm.date) return true;
-    const hasInferiorDate = Boolean(prevWm.date) && Boolean(nextWm.date) && nextWm.date !== prevWm.date && (
-      nextDateRank < prevDateRank ||
-      (nextDateRank < 2 && prevDateRank < 2 && nextWm.date > prevWm.date)
-    );
-    if (!hasInferiorDate && nextWm.isPriced && nextWm.costUSD > (prevWm.costUSD || 0) + 1e-12) return true;
+    const usageRegressed = usageCmp < 0;
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    if (!usageRegressed && revCmp > 0) return true;
+    const takeNextDate = canAdoptNextDate(nextWm, prevWm);
+    if (
+      takeNextDate &&
+      nextDateRank >= 2 &&
+      nextDateRank === prevDateRank &&
+      Boolean(nextWm.date) &&
+      (
+        nextWm.date !== prevWm.date ||
+        (nextDateRank >= 3 && Boolean(nextWm.createdAt) && nextWm.createdAt !== (prevWm.createdAt || ''))
+      )
+    ) {
+      return true;
+    }
+    const hasUnacceptedDate = Boolean(prevWm.date) && Boolean(nextWm.date) && nextWm.date !== prevWm.date && !takeNextDate;
+    if (!usageRegressed && revCmp >= 0 && !hasUnacceptedDate && nextWm.isPriced && !(prevWm.costUSD > 0) && nextWm.costUSD > 0) return true;
     return false;
   }
 
@@ -3532,23 +3618,32 @@
     const prevRank = getModelRank(prevWm.model, prevWm.modelKey);
     const nextDateRank = nextWm.dateRank || 0;
     const prevDateRank = prevWm.dateRank || 0;
-    const takeNextDate = nextDateRank > prevDateRank
-      || (nextDateRank >= 2 && nextDateRank === prevDateRank && Boolean(nextWm.date))
-      || (nextDateRank === prevDateRank && Boolean(nextWm.date) && (!prevWm.date || nextWm.date < prevWm.date));
-    const nextChangedDateTier = takeNextDate && Boolean(nextWm.date) && nextWm.date !== prevWm.date;
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    const usageRegressed = usageCmp < 0;
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    const takeNextUsage = usageCmp > 0 || (usageCmp === 0 && revCmp >= 0);
+    const takeNextDate = canAdoptNextDate(nextWm, prevWm);
+    const mergedSourceRevision = revCmp >= 0
+      ? (nextWm.sourceRevision ?? prevWm.sourceRevision ?? null)
+      : (prevWm.sourceRevision ?? null);
     let mergedCost = Math.max(prevWm.isPriced ? (prevWm.costUSD || 0) : 0, nextWm.isPriced ? (nextWm.costUSD || 0) : 0);
-    if (nextChangedDateTier && nextWm.isPriced && nextWm.tot >= prevWm.tot && nextWm.out >= prevWm.out) {
+    if (!usageRegressed && revCmp >= 0 && nextWm.isPriced && (takeNextDate || nextWm.date === prevWm.date || !prevWm.date)) {
       mergedCost = nextWm.costUSD || 0;
     }
     return {
-      tot: Math.max(prevWm.tot, nextWm.tot),
-      out: Math.max(prevWm.out, nextWm.out),
+      inp: takeNextUsage ? (nextWm.inp ?? 0) : (prevWm.inp ?? 0),
+      cap: takeNextUsage ? (nextWm.cap ?? 0) : (prevWm.cap ?? 0),
+      tot: takeNextUsage ? nextWm.tot : prevWm.tot,
+      out: takeNextUsage ? nextWm.out : prevWm.out,
       model: nextRank >= prevRank && nextWm.model ? nextWm.model : prevWm.model,
       modelKey: nextWm.modelKey || prevWm.modelKey || '',
       isPriced: Boolean(prevWm.isPriced || nextWm.isPriced),
       costUSD: mergedCost,
       date: takeNextDate ? nextWm.date : (prevWm.date || nextWm.date || ''),
-      dateRank: Math.max(prevDateRank, nextDateRank)
+      createdAt: takeNextDate ? (nextWm.createdAt || '') : (prevWm.createdAt || ''),
+      dateSource: takeNextDate ? (nextWm.dateSource || '') : (prevWm.dateSource || ''),
+      dateRank: Math.max(prevDateRank, nextDateRank),
+      sourceRevision: mergedSourceRevision
     };
   }
 
@@ -3557,7 +3652,9 @@
     const prevWm = getFinalCallWatermark(prevCall);
     const nextWm = getFinalCallWatermark(nextCall);
     const merged = { ...nextCall };
-    const takePrevUsage = prevWm.tot > nextWm.tot || (prevWm.tot === nextWm.tot && prevWm.out > nextWm.out);
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    const takePrevUsage = usageCmp < 0 || (usageCmp === 0 && revCmp < 0);
     if (takePrevUsage) {
       merged.inputTokens = prevCall.inputTokens;
       merged.cacheTokens = prevCall.cacheTokens;
@@ -3567,16 +3664,22 @@
       merged.responseTokens = prevCall.responseTokens;
       merged.totalTokens = prevCall.totalTokens;
     }
-    const prevDateRank = prevWm.dateRank || 0;
-    const nextDateRank = nextWm.dateRank || 0;
-    const takePrevDate = prevDateRank > nextDateRank
-      || (prevDateRank === nextDateRank && prevDateRank < 2 && Boolean(prevWm.date) && (!nextWm.date || prevWm.date < nextWm.date));
+    const takeNextDate = canAdoptNextDate(nextWm, prevWm);
+    const takePrevDate = !takeNextDate && Boolean(prevWm.date || (prevWm.dateRank || 0) > (nextWm.dateRank || 0));
     if (takePrevDate) {
       merged.date = prevCall.date;
       merged.created_at = prevCall.created_at;
       if (prevCall.dateSource !== undefined) merged.dateSource = prevCall.dateSource;
       else delete merged.dateSource;
       merged.dateIsProvisional = prevCall.dateIsProvisional;
+      if (prevCall.timestamp !== undefined) merged.timestamp = prevCall.timestamp;
+    }
+    if (revCmp < 0 && prevWm.sourceRevision !== null) {
+      merged.sourceRevision = prevWm.sourceRevision;
+    } else if (nextWm.sourceRevision !== null) {
+      merged.sourceRevision = nextWm.sourceRevision;
+    } else {
+      delete merged.sourceRevision;
     }
     if (getModelRank(prevWm.model, prevWm.modelKey) > getModelRank(nextWm.model, nextWm.modelKey)) {
       merged.model = prevCall.model;
@@ -3621,9 +3724,10 @@
     for (const entry of entries) {
       state.quarantinedOversizeMap?.delete(entry.callId);
       const curSynced = state.syncedFinalMap.get(entry.callId);
-      state.syncedFinalMap.set(entry.callId, mergeWatermarks(curSynced, entry.wm));
+      const nextSynced = mergeWatermarks(curSynced, entry.wm);
+      state.syncedFinalMap.set(entry.callId, nextSynced);
       const curPending = state.pendingFinalCalls.get(entry.callId);
-      if (curPending && !hasWatermarkProgressed(getFinalCallWatermark(curPending), entry.wm)) {
+      if (curPending && !hasWatermarkProgressed(getFinalCallWatermark(curPending), nextSynced)) {
         state.pendingFinalCalls.delete(entry.callId);
       }
     }
@@ -3765,23 +3869,64 @@
           let effectiveCall = (prevSessionCall && call.status === 'final' && prevSessionCall.status === 'final')
             ? mergePendingCallData(prevSessionCall, call)
             : call;
-          if (effectiveCall.status === 'final' && getDateRank(effectiveCall) === 1) {
-            let earliestProvDate = effectiveCall.date ? String(effectiveCall.date).slice(0, 10) : '';
-            for (const ref of [prevPending, prevSynced, prevQuarantined]) {
-              const refRank = ref ? (ref.dateRank !== undefined ? ref.dateRank : getDateRank(ref)) : 0;
-              const refDate = ref?.date ? String(ref.date).slice(0, 10) : '';
-              if (refRank === 1 && refDate && (!earliestProvDate || refDate < earliestProvDate)) {
-                earliestProvDate = refDate;
+          if (prevPending && effectiveCall.status === 'final' && prevPending.status === 'final') {
+            effectiveCall = mergePendingCallData(prevPending, effectiveCall);
+          }
+          if (effectiveCall.status === 'final') {
+            if (prevSynced) {
+              const effWm0 = getFinalCallWatermark(effectiveCall);
+              const uCmp0 = compareWatermarkUsage(effWm0, prevSynced);
+              const rCmp0 = compareSourceRevision(effWm0.sourceRevision, prevSynced.sourceRevision);
+              const restoreSyncedUsage = (uCmp0 < 0 || (uCmp0 === 0 && rCmp0 < 0)) && prevSynced.inp !== undefined;
+              const restoreSyncedDate = (prevSynced.dateRank || 0) >= 2 && Boolean(prevSynced.date) && !canAdoptNextDate(effWm0, prevSynced);
+              const restoreSyncedRev = rCmp0 < 0 && prevSynced.sourceRevision !== null && prevSynced.sourceRevision !== undefined;
+              if (restoreSyncedUsage || restoreSyncedDate || restoreSyncedRev) {
+                effectiveCall = {
+                  ...effectiveCall,
+                  ...(restoreSyncedUsage ? {
+                    inputTokens: prevSynced.inp,
+                    cacheTokens: prevSynced.cap,
+                    cacheReadTokens: prevSynced.cap,
+                    outputTokens: prevSynced.out,
+                    totalTokens: prevSynced.tot
+                  } : {}),
+                  ...(restoreSyncedDate ? {
+                    date: prevSynced.date,
+                    created_at: prevSynced.createdAt || null,
+                    ...(prevSynced.dateSource ? { dateSource: prevSynced.dateSource } : {}),
+                    dateIsProvisional: false
+                  } : {}),
+                  ...(restoreSyncedRev ? { sourceRevision: prevSynced.sourceRevision } : {})
+                };
+                if (restoreSyncedDate && !prevSynced.dateSource) delete effectiveCall.dateSource;
+                if (typeof calculateRequestApiCost === 'function' && (effectiveCall.model || effectiveCall.modelKey)) {
+                  const recalc = calculateRequestApiCost(effectiveCall);
+                  if (recalc.isPriced) {
+                    effectiveCall.modelKey = recalc.modelKey;
+                    effectiveCall.isPriced = true;
+                    effectiveCall.costUSD = recalc.costUSD ?? 0;
+                  }
+                }
               }
             }
-            if (earliestProvDate && earliestProvDate !== String(effectiveCall.date || '').slice(0, 10)) {
-              effectiveCall = { ...effectiveCall, date: earliestProvDate, created_at: null, dateSource: 'provisional', dateIsProvisional: true };
-              if (typeof calculateRequestApiCost === 'function' && (effectiveCall.model || effectiveCall.modelKey)) {
-                const recalc = calculateRequestApiCost(effectiveCall);
-                if (recalc.isPriced) {
-                  effectiveCall.modelKey = recalc.modelKey;
-                  effectiveCall.isPriced = true;
-                  effectiveCall.costUSD = recalc.costUSD ?? 0;
+            if (getDateRank(effectiveCall) === 1) {
+              let earliestProvDate = effectiveCall.date ? String(effectiveCall.date).slice(0, 10) : '';
+              for (const ref of [prevPending, prevSynced, prevQuarantined]) {
+                const refRank = ref ? (ref.dateRank !== undefined ? ref.dateRank : getDateRank(ref)) : 0;
+                const refDate = ref?.date ? String(ref.date).slice(0, 10) : '';
+                if (refRank === 1 && refDate && (!earliestProvDate || refDate < earliestProvDate)) {
+                  earliestProvDate = refDate;
+                }
+              }
+              if (earliestProvDate && earliestProvDate !== String(effectiveCall.date || '').slice(0, 10)) {
+                effectiveCall = { ...effectiveCall, date: earliestProvDate, created_at: null, dateSource: 'provisional', dateIsProvisional: true };
+                if (typeof calculateRequestApiCost === 'function' && (effectiveCall.model || effectiveCall.modelKey)) {
+                  const recalc = calculateRequestApiCost(effectiveCall);
+                  if (recalc.isPriced) {
+                    effectiveCall.modelKey = recalc.modelKey;
+                    effectiveCall.isPriced = true;
+                    effectiveCall.costUSD = recalc.costUSD ?? 0;
+                  }
                 }
               }
             }
@@ -3802,8 +3947,9 @@
                 }
               }
               const notRegressedVsPending = !prevPendingWm || (
-                wm.tot >= prevPendingWm.tot &&
-                wm.out >= prevPendingWm.out &&
+                compareWatermarkUsage(wm, prevPendingWm) >= 0 &&
+                compareSourceRevision(wm.sourceRevision, prevPendingWm.sourceRevision) >= 0 &&
+                canAdoptNextDate(wm, prevPendingWm) &&
                 getModelRank(wm.model, wm.modelKey) >= getModelRank(prevPendingWm.model, prevPendingWm.modelKey) &&
                 (wm.dateRank || 0) >= (prevPendingWm.dateRank || 0) &&
                 (!prevPendingWm.modelKey || Boolean(wm.modelKey)) &&

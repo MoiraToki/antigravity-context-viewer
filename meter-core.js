@@ -12,8 +12,9 @@
 
   function getModelPoolKey(raw) {
     if (!raw) return 'unknown';
-    const s = String(raw).toLowerCase();
-    if (s.includes('carbon') || s.includes('gemini-4-carbon')) return 'gemini-4-carbon';
+    const s = String(raw).trim().toLowerCase();
+    if (s.includes('hydrogen') || s.includes('gemini-4-hydrogen')) return 'gemini-4-hydrogen';
+    if (s.includes('carbon') || s.includes('gemini-4-carbon') || s === 'gemini-pro-orchestrator') return 'gemini-4-carbon';
     if (s.includes('argon') || s.includes('gemini-4-argon')) return 'gemini-4-argon';
     if (s.includes('flash') || s.includes('gemini-3.8-flash')) return 'gemini-3.8-flash';
     if (s.includes('opus') || s.includes('claude-opus')) return 'claude-opus-5-5';
@@ -48,11 +49,11 @@
     const poolKey = getModelPoolKey(modelIdOrName);
     const targetStr = String(modelIdOrName).toLowerCase();
 
-    // 1. 优先精准匹配 modelId / modelOrAlias.model 或 label
+    // 1. 优先精准匹配 modelId、modelOrAlias.model 或 label（逐字段独立比对，防止非空占位 modelId 遮蔽 modelOrAlias.model）
     let matched = cascadeModelConfigs.find(c => {
-      const mId = String(c.modelId || c.modelOrAlias?.model || '').toLowerCase();
-      const lbl = String(c.label || '').toLowerCase();
-      return (mId && mId === targetStr) || (lbl && lbl === targetStr);
+      if (!c || typeof c !== 'object') return false;
+      const candidates = [c.modelId, c.modelOrAlias?.model, c.label];
+      return candidates.some(cand => cand && String(cand).toLowerCase() === targetStr);
     });
 
     // 2. 匹配同一配额池（按 label -> modelId -> modelOrAlias.model 依次尝试家族匹配，防止通用标签如 "High" 遮住可识别模型 ID）
@@ -70,6 +71,7 @@
 
     const qi = matched.quotaInfo || {};
     const poolNames = {
+      'gemini-4-hydrogen': 'Gemini 4 Hydrogen 配额池',
       'gemini-4-carbon': 'Gemini 4 Carbon 配额池',
       'gemini-4-argon': 'Gemini 4 Argon 配额池',
       'gemini-3.8-flash': 'Gemini 3.8 Flash 配额池',
@@ -422,8 +424,10 @@
   }
 
   // 官方 Developer API Standard 公开费率表 (USD / 百万 Token)
-  // 来源: https://ai.google.dev/gemini-api/docs/pricing
-  // 核对日期: 2026-11-08
+  // 来源: https://ai.google.dev/gemini-api/docs/pricing , https://aistudio.google.com/docs/pricing
+  //       https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-hydrogen/
+  //       https://platform.claude.com/docs/en/about-claude/pricing
+  // 核对日期: 2026-11-13
   const GEMINI_PRICING_TABLE = {
     'gemini-3.8-flash': [
       {
@@ -437,6 +441,13 @@
         inputPerMillion: 1.50,
         outputPerMillion: 7.50,
         cacheReadPerMillion: 0.15
+      }
+    ],
+    'gemini-4-hydrogen': [
+      {
+        inputPerMillion: 1.50,
+        outputPerMillion: 7.50,
+        cacheReadPerMillion: 0.075
       }
     ],
     'gemini-4-carbon': [
@@ -529,13 +540,14 @@
     if (!raw || typeof raw !== 'string') return null;
     const str = raw.trim().toLowerCase();
     if (str.includes('3.8-flash') || str.includes('3.8 flash') || str.includes('flash-n')) return 'gemini-3.8-flash';
-    if (str.includes('4-carbon') || str.includes('4 carbon') || str.includes('carbon')) return 'gemini-4-carbon';
+    if (str.includes('4-hydrogen') || str.includes('4 hydrogen') || str.includes('hydrogen')) return 'gemini-4-hydrogen';
+    if (str.includes('4-carbon') || str.includes('4 carbon') || str.includes('carbon') || str === 'gemini-pro-orchestrator') return 'gemini-4-carbon';
     if (str.includes('4-argon') || str.includes('4 argon') || str.includes('argon')) return 'gemini-4-argon';
     if (str.includes('3.1-pro') || str.includes('3.1 pro')) return 'gemini-3.1-pro-preview';
     if (str.includes('3.5-flash-lite') || str.includes('3.5 flash-lite') || str.includes('flash-lite')) return 'gemini-3.5-flash-lite';
     if (str.includes('2.5-pro') || str.includes('2.5 pro')) return 'gemini-2.5-pro';
-    if (/(?:opus[-_ ]5[._-]5|5[._-]5[-_ ]opus)(?![0-9])/.test(str)) return 'claude-opus-5-5';
-    if (/(?:sonnet[-_ ]5[._-]5|5[._-]5[-_ ]sonnet)(?![0-9])/.test(str)) return 'claude-sonnet-5-5';
+    if (/(?:opus[-_ ]5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])|5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])[-_ ]opus)/.test(str)) return 'claude-opus-5-5';
+    if (/(?:sonnet[-_ ]5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])|5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])[-_ ]sonnet)/.test(str)) return 'claude-sonnet-5-5';
     return null;
   }
 
@@ -555,7 +567,7 @@
     let reqDate = '2026-11-08';
     const hasExplicitDate = req.date && /^\d{4}-\d{2}-\d{2}/.test(String(req.date));
     const isProv = req.dateIsProvisional === true || req.dateSource === 'provisional';
-    if (!isProv && req.created_at && (!hasExplicitDate || !req.dateSource)) {
+    if (!isProv && req.created_at && (!hasExplicitDate || !req.dateSource || req.dateSource === 'created_at')) {
       const dt = new Date(req.created_at);
       if (!Number.isNaN(dt.getTime())) {
         reqDate = formatLocalDateStr(dt);
@@ -786,6 +798,19 @@
       dateIsProvisional = true;
     }
 
+    let sourceRevision = null;
+    const rawRev = row.sourceRevision ?? row.revision ?? row.metadataRevision;
+    if (rawRev !== undefined && rawRev !== null && rawRev !== '') {
+      const revNum = Number(rawRev);
+      if (Number.isFinite(revNum)) sourceRevision = revNum;
+    } else {
+      const rawUpdated = row.updated_at ?? row.sourceUpdatedAt;
+      if (rawUpdated !== undefined && rawUpdated !== null && rawUpdated !== '') {
+        const updTs = typeof rawUpdated === 'number' ? rawUpdated : Date.parse(String(rawUpdated));
+        if (Number.isFinite(updTs)) sourceRevision = updTs;
+      }
+    }
+
     const reqObj = {
       model,
       inputTokens: input,
@@ -821,7 +846,8 @@
       ...(dateSource ? { dateSource } : {}),
       dateIsProvisional,
       created_at: rawCreatedAt ? String(rawCreatedAt) : null,
-      timestamp: callTimestamp
+      timestamp: callTimestamp,
+      ...(sourceRevision !== null ? { sourceRevision } : {})
     };
   }
 
@@ -1033,6 +1059,7 @@
 
     const modelNameMap = {
       'gemini-3.8-flash': 'Gemini 3.8 Flash Standard',
+      'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
       'gemini-4-carbon': 'Gemini 4 Carbon',
       'gemini-4-argon': 'Gemini 4 Argon',
       'gemini-3.1-pro-preview': 'Gemini 3.1 Pro Preview',
